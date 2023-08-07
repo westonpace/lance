@@ -15,7 +15,7 @@
 //! SQL Parser utility
 
 use datafusion::sql::sqlparser::{
-    ast::{Expr, SetExpr, Statement},
+    ast::Expr,
     dialect::{Dialect, GenericDialect},
     parser::Parser,
     tokenizer::{Token, Tokenizer},
@@ -48,14 +48,12 @@ impl Dialect for LanceDialect {
 
 /// Parse sql filter to Expression.
 pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
-    let sql = format!("SELECT 1 FROM t WHERE {filter}");
-
     let dialect = LanceDialect::new();
 
     // Hack to allow == as equals
     // This is used to parse PyArrow expressions from strings.
     // See: https://github.com/sqlparser-rs/sqlparser-rs/pull/815#issuecomment-1450714278
-    let mut tokenizer = Tokenizer::new(&dialect, &sql);
+    let mut tokenizer = Tokenizer::new(&dialect, &filter);
     let mut tokens = Vec::new();
     let mut token_iter = tokenizer.tokenize()?.into_iter();
     let mut prev_token = token_iter.next().unwrap();
@@ -68,23 +66,14 @@ pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
     }
     tokens.push(prev_token);
 
-    let statement = Parser::new(&dialect)
+    Parser::new(&dialect)
         .with_tokens(tokens)
-        .parse_statement()?;
-
-    let selection = if let Statement::Query(query) = &statement {
-        if let SetExpr::Select(s) = query.body.as_ref() {
-            s.selection.as_ref()
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let expr = selection.ok_or_else(|| Error::IO {
-        message: format!("Filter is not valid: {filter}"),
-    })?;
-    Ok(expr.clone())
+        .parse_expr()
+        .or_else(|_| {
+            Err(Error::IO {
+                message: format!("Filter is not valid: {filter}"),
+            })
+        })
 }
 
 #[cfg(test)]

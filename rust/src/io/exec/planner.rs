@@ -17,16 +17,18 @@
 use std::sync::Arc;
 
 use arrow_cast::can_cast_types;
-use arrow_schema::{DataType as ArrowDataType, SchemaRef, TimeUnit};
-use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr, Function,
-    FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
-};
+use arrow_schema::{DataType as ArrowDataType, SchemaRef};
+use datafusion::common::{Result as DatafusionResult, ToDFSchema};
+use datafusion::config::ConfigOptions;
+use datafusion::error::DataFusionError;
+use datafusion::logical_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
+use datafusion::physical_plan::expressions::GetIndexedFieldExpr;
+use datafusion::sql::planner::{ContextProvider, PlannerContext, SqlToRel};
+use datafusion::sql::TableReference;
 use datafusion::{
     logical_expr::{
-        col,
         expr::{InList, ScalarFunction},
-        BinaryExpr, BuiltinScalarFunction, Like, Operator,
+        BuiltinScalarFunction,
     },
     physical_expr::execution_props::ExecutionProps,
     physical_plan::{
@@ -36,7 +38,6 @@ use datafusion::{
         functions, PhysicalExpr,
     },
     prelude::Expr,
-    scalar::ScalarValue,
 };
 
 use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
@@ -47,322 +48,47 @@ use crate::{
 
 pub struct Planner {
     schema: SchemaRef,
+    df_config_opts: ConfigOptions,
+}
+
+impl ContextProvider for Planner {
+    fn get_table_provider(&self, name: TableReference) -> DatafusionResult<Arc<dyn TableSource>> {
+        Err(DataFusionError::Internal(
+            format!("Lance ContextProvider only supports scalar expressions but got reference to table {name:?}")
+        ))
+    }
+
+    fn get_function_meta(&self, _name: &str) -> Option<Arc<ScalarUDF>> {
+        None
+    }
+
+    fn get_aggregate_meta(&self, _name: &str) -> Option<Arc<AggregateUDF>> {
+        None
+    }
+
+    fn get_window_meta(&self, _name: &str) -> Option<Arc<WindowUDF>> {
+        None
+    }
+
+    fn get_variable_type(&self, variable_names: &[String]) -> Option<ArrowDataType> {
+        if variable_names.len() != 1 {
+            return None;
+        }
+        self.schema
+            .column_with_name(variable_names[0].as_str())
+            .map(|c| c.1.data_type().clone())
+    }
+
+    fn options(&self) -> &ConfigOptions {
+        &self.df_config_opts
+    }
 }
 
 impl Planner {
     pub fn new(schema: SchemaRef) -> Self {
-        Self { schema }
-    }
-
-    fn column(&self, idents: &[Ident]) -> Result<Expr> {
-        Ok(col(idents
-            .iter()
-            .map(|id| id.value.clone())
-            .collect::<Vec<_>>()
-            .join(".")))
-    }
-
-    fn binary_op(&self, op: &BinaryOperator) -> Result<Operator> {
-        Ok(match op {
-            BinaryOperator::Plus => Operator::Plus,
-            BinaryOperator::Minus => Operator::Minus,
-            BinaryOperator::Multiply => Operator::Multiply,
-            BinaryOperator::Divide => Operator::Divide,
-            BinaryOperator::Modulo => Operator::Modulo,
-            BinaryOperator::StringConcat => Operator::StringConcat,
-            BinaryOperator::Gt => Operator::Gt,
-            BinaryOperator::Lt => Operator::Lt,
-            BinaryOperator::GtEq => Operator::GtEq,
-            BinaryOperator::LtEq => Operator::LtEq,
-            BinaryOperator::Eq => Operator::Eq,
-            BinaryOperator::NotEq => Operator::NotEq,
-            BinaryOperator::And => Operator::And,
-            BinaryOperator::Or => Operator::Or,
-            _ => {
-                return Err(Error::IO {
-                    message: format!("Operator {op} is not supported"),
-                })
-            }
-        })
-    }
-
-    fn binary_expr(&self, left: &SQLExpr, op: &BinaryOperator, right: &SQLExpr) -> Result<Expr> {
-        Ok(Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(self.parse_sql_expr(left)?),
-            self.binary_op(op)?,
-            Box::new(self.parse_sql_expr(right)?),
-        )))
-    }
-
-    fn unary_expr(&self, op: &UnaryOperator, expr: &SQLExpr) -> Result<Expr> {
-        Ok(match op {
-            UnaryOperator::Not | UnaryOperator::PGBitwiseNot => {
-                Expr::Not(Box::new(self.parse_sql_expr(expr)?))
-            }
-
-            UnaryOperator::Minus => {
-                use datafusion::logical_expr::lit;
-                match expr {
-                    SQLExpr::Value(Value::Number(n, _)) => match n.parse::<i64>() {
-                        Ok(n) => lit(-n),
-                        Err(_) => lit(-n
-                            .parse::<f64>()
-                            .map_err(|_e| {
-                                Error::IO{
-                                    message: format!("negative operator can be only applied to integer and float operands, got: {n}")
-                                }
-                            })?),
-                    },
-                    _ => {
-                        Expr::Negative(Box::new(self.parse_sql_expr(expr)?))
-                    }
-                }
-            }
-
-            _ => {
-                return Err(Error::IO {
-                    message: format!("Unary operator '{:?}' is not supported", op),
-                })
-            }
-        })
-    }
-
-    // See datafusion `sqlToRel::parse_sql_number()`
-    fn number(&self, value: &str) -> Result<Expr> {
-        use datafusion::logical_expr::lit;
-        if let Ok(n) = value.parse::<i64>() {
-            Ok(lit(n))
-        } else {
-            value.parse::<f64>().map(lit).map_err(|_| Error::IO {
-                message: format!("'{value}' is not supported number value."),
-            })
-        }
-    }
-
-    fn value(&self, value: &Value) -> Result<Expr> {
-        Ok(match value {
-            Value::Number(v, _) => self.number(v.as_str())?,
-            Value::SingleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone()))),
-            Value::DollarQuotedString(_) => todo!(),
-            Value::EscapedStringLiteral(_) => todo!(),
-            Value::NationalStringLiteral(_) => todo!(),
-            Value::HexStringLiteral(_) => todo!(),
-            Value::DoubleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone()))),
-            Value::Boolean(v) => Expr::Literal(ScalarValue::Boolean(Some(*v))),
-            Value::Null => Expr::Literal(ScalarValue::Null),
-            Value::Placeholder(_) => todo!(),
-            Value::UnQuotedString(_) => todo!(),
-            Value::SingleQuotedByteStringLiteral(_) => todo!(),
-            Value::DoubleQuotedByteStringLiteral(_) => todo!(),
-            Value::RawStringLiteral(_) => todo!(),
-        })
-    }
-
-    fn parse_function_args(&self, func_args: &FunctionArg) -> Result<Expr> {
-        match func_args {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self.parse_sql_expr(expr),
-            _ => Err(Error::IO {
-                message: format!("Unsupported function args: {:?}", func_args),
-            }),
-        }
-    }
-
-    fn parse_function(&self, func: &Function) -> Result<Expr> {
-        if func.name.to_string() == "is_valid" {
-            if func.args.len() != 1 {
-                return Err(Error::IO {
-                    message: format!("is_valid only support 1 args, got {}", func.args.len()),
-                });
-            }
-            return Ok(Expr::IsNotNull(Box::new(
-                self.parse_function_args(&func.args[0])?,
-            )));
-        } else if func.name.to_string() == "regexp_match" {
-            if func.args.len() != 2 {
-                return Err(Error::IO {
-                    message: format!("regexp_match only supports 2 args, got {}", func.args.len()),
-                });
-            }
-
-            let args_vec: Vec<Expr> = func
-                .args
-                .iter()
-                .map(|arg| self.parse_function_args(arg).unwrap())
-                .collect::<Vec<_>>();
-
-            return Ok(Expr::ScalarFunction(ScalarFunction {
-                fun: BuiltinScalarFunction::RegexpMatch,
-                args: args_vec,
-            }));
-        }
-        Err(Error::IO {
-            message: format!("function '{}' is not supported", func.name),
-        })
-    }
-
-    fn parse_type(&self, data_type: &SQLDataType) -> Result<ArrowDataType> {
-        const SUPPORTED_TYPES: [&str; 13] = [
-            "int [unsigned]",
-            "tinyint [unsigned]",
-            "smallint [unsigned]",
-            "bigint [unsigned]",
-            "float",
-            "double",
-            "string",
-            "binary",
-            "date",
-            "timestamp(precision)",
-            "datetime(precision)",
-            "decimal(precision,scale)",
-            "boolean",
-        ];
-        match data_type {
-            SQLDataType::String => Ok(ArrowDataType::Utf8),
-            SQLDataType::Binary(_) => Ok(ArrowDataType::Binary),
-            SQLDataType::Float(_) => Ok(ArrowDataType::Float32),
-            SQLDataType::Double => Ok(ArrowDataType::Float64),
-            SQLDataType::Boolean => Ok(ArrowDataType::Boolean),
-            SQLDataType::TinyInt(_) => Ok(ArrowDataType::Int8),
-            SQLDataType::SmallInt(_) => Ok(ArrowDataType::Int16),
-            SQLDataType::Int(_) | SQLDataType::Integer(_) => Ok(ArrowDataType::Int32),
-            SQLDataType::BigInt(_) => Ok(ArrowDataType::Int64),
-            SQLDataType::UnsignedTinyInt(_) => Ok(ArrowDataType::UInt8),
-            SQLDataType::UnsignedSmallInt(_) => Ok(ArrowDataType::UInt16),
-            SQLDataType::UnsignedInt(_) | SQLDataType::UnsignedInteger(_) => {
-                Ok(ArrowDataType::UInt32)
-            }
-            SQLDataType::UnsignedBigInt(_) => Ok(ArrowDataType::UInt64),
-            SQLDataType::Date => Ok(ArrowDataType::Date32),
-            SQLDataType::Timestamp(resolution, tz) => {
-                match tz {
-                    TimezoneInfo::None => {}
-                    _ => {
-                        return Err(Error::IO {
-                            message: "Timezone not supported in timestamp".to_string(),
-                        })
-                    }
-                };
-                let time_unit = match resolution {
-                    // Default to microsecond to match PyArrow
-                    None => TimeUnit::Microsecond,
-                    Some(0) => TimeUnit::Second,
-                    Some(3) => TimeUnit::Millisecond,
-                    Some(6) => TimeUnit::Microsecond,
-                    Some(9) => TimeUnit::Nanosecond,
-                    _ => {
-                        return Err(Error::IO {
-                            message: format!("Unsupported datetime resolution: {:?}", resolution),
-                        })
-                    }
-                };
-                Ok(ArrowDataType::Timestamp(time_unit, None))
-            }
-            SQLDataType::Datetime(resolution) => {
-                let time_unit = match resolution {
-                    None => TimeUnit::Microsecond,
-                    Some(0) => TimeUnit::Second,
-                    Some(3) => TimeUnit::Millisecond,
-                    Some(6) => TimeUnit::Microsecond,
-                    Some(9) => TimeUnit::Nanosecond,
-                    _ => {
-                        return Err(Error::IO {
-                            message: format!("Unsupported datetime resolution: {:?}", resolution),
-                        })
-                    }
-                };
-                Ok(ArrowDataType::Timestamp(time_unit, None))
-            }
-            SQLDataType::Decimal(number_info) => match number_info {
-                ExactNumberInfo::PrecisionAndScale(precision, scale) => {
-                    Ok(ArrowDataType::Decimal128(*precision as u8, *scale as i8))
-                }
-                _ => Err(Error::IO {
-                    message: format!(
-                        "Must provide precision and scale for decimal: {:?}",
-                        number_info
-                    ),
-                }),
-            },
-            _ => Err(Error::IO {
-                message: format!(
-                    "Unsupported data type: {:?}. Supported types: {:?}",
-                    data_type, SUPPORTED_TYPES
-                ),
-            }),
-        }
-    }
-
-    fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
-        match expr {
-            SQLExpr::Identifier(id) => {
-                if id.quote_style == Some('"') {
-                    Ok(Expr::Literal(ScalarValue::Utf8(Some(id.value.clone()))))
-                } else {
-                    self.column(vec![id.clone()].as_slice())
-                }
-            }
-            SQLExpr::CompoundIdentifier(ids) => self.column(ids.as_slice()),
-            SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
-            SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
-            SQLExpr::Value(value) => self.value(value),
-            // For example, DATE '2020-01-01'
-            SQLExpr::TypedString { data_type, value } => {
-                Ok(Expr::Cast(datafusion::logical_expr::Cast {
-                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value.clone())))),
-                    data_type: self.parse_type(data_type)?,
-                }))
-            }
-            SQLExpr::IsFalse(expr) => Ok(Expr::IsFalse(Box::new(self.parse_sql_expr(expr)?))),
-            SQLExpr::IsNotFalse(_) => Ok(Expr::IsNotFalse(Box::new(self.parse_sql_expr(expr)?))),
-            SQLExpr::IsTrue(expr) => Ok(Expr::IsTrue(Box::new(self.parse_sql_expr(expr)?))),
-            SQLExpr::IsNotTrue(expr) => Ok(Expr::IsNotTrue(Box::new(self.parse_sql_expr(expr)?))),
-            SQLExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.parse_sql_expr(expr)?))),
-            SQLExpr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(self.parse_sql_expr(expr)?))),
-            SQLExpr::InList {
-                expr,
-                list,
-                negated,
-            } => {
-                let value_expr = self.parse_sql_expr(expr)?;
-                let list_exprs = list
-                    .iter()
-                    .map(|e| self.parse_sql_expr(e))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(value_expr.in_list(list_exprs, *negated))
-            }
-            SQLExpr::Nested(inner) => self.parse_sql_expr(inner.as_ref()),
-            SQLExpr::Function(func) => self.parse_function(func),
-            SQLExpr::ILike {
-                negated,
-                expr,
-                pattern,
-                escape_char,
-            } => Ok(Expr::Like(Like::new(
-                *negated,
-                Box::new(self.parse_sql_expr(expr)?),
-                Box::new(self.parse_sql_expr(pattern)?),
-                *escape_char,
-                true,
-            ))),
-            SQLExpr::Like {
-                negated,
-                expr,
-                pattern,
-                escape_char,
-            } => Ok(Expr::Like(Like::new(
-                *negated,
-                Box::new(self.parse_sql_expr(expr)?),
-                Box::new(self.parse_sql_expr(pattern)?),
-                *escape_char,
-                false,
-            ))),
-            SQLExpr::Cast { expr, data_type } => Ok(Expr::Cast(datafusion::logical_expr::Cast {
-                expr: Box::new(self.parse_sql_expr(expr)?),
-                data_type: self.parse_type(data_type)?,
-            })),
-            _ => Err(Error::IO {
-                message: format!("Expression '{expr}' is not supported as filter in lance"),
-            }),
+        Self {
+            schema,
+            df_config_opts: ConfigOptions::default(),
         }
     }
 
@@ -371,7 +97,10 @@ impl Planner {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
 
         let ast_expr = parse_sql_filter(filter)?;
-        let expr = self.parse_sql_expr(&ast_expr)?;
+        let df_schema = self.schema.clone().to_dfschema()?;
+        let mut unused_context = PlannerContext::new();
+        let expr = SqlToRel::new(self).sql_to_expr(ast_expr, &df_schema, &mut unused_context)?;
+        // let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
         let resolved = resolve_expr(&expr, &schema)?;
         coerce_filter_type_to_boolean(resolved)
@@ -404,6 +133,10 @@ impl Planner {
                     right
                 };
                 Arc::new(BinaryExpr::new(left, expr.op, right))
+            }
+            Expr::GetIndexedField(indexed_field) => {
+                let expr = self.create_physical_expr(&*indexed_field.expr)?;
+                Arc::new(GetIndexedFieldExpr::new(expr, indexed_field.key.clone()))
             }
             Expr::Negative(expr) => {
                 Arc::new(NegativeExpr::new(self.create_physical_expr(expr.as_ref())?))
@@ -451,7 +184,9 @@ impl Planner {
                 Arc::new(CastExpr::new(expr, data_type.clone(), None))
             }
             Expr::ScalarFunction(ScalarFunction { fun, args }) => {
-                if fun != &BuiltinScalarFunction::RegexpMatch {
+                if fun != &BuiltinScalarFunction::RegexpMatch
+                    && fun != &BuiltinScalarFunction::ArrayContains
+                {
                     return Err(Error::IO {
                         message: format!("Scalar function '{:?}' is not supported", fun),
                     });
@@ -484,7 +219,7 @@ impl Planner {
             }
             _ => {
                 return Err(Error::IO {
-                    message: format!("Expression '{expr}' is not supported as filter in lance"),
+                    message: format!("Expression '{expr:?}' is not supported as filter in lance"),
                 })
             }
         })
@@ -502,8 +237,11 @@ mod tests {
         StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray,
     };
-    use arrow_schema::{DataType, Field, Fields, Schema};
-    use datafusion::logical_expr::{col, lit, Cast};
+    use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
+    use datafusion::{
+        logical_expr::{col, lit, BinaryExpr, Cast, GetIndexedField},
+        scalar::ScalarValue,
+    };
 
     #[test]
     fn test_parse_filter_simple() {
@@ -522,14 +260,16 @@ mod tests {
 
         let planner = Planner::new(schema.clone());
 
-        let expected = col("i")
-            .gt(lit(3_i32))
-            .and(col("st.x").lt_eq(lit(5.0_f32)))
-            .and(
-                col("s")
-                    .eq(lit("str-4"))
-                    .or(col("s").in_list(vec![lit("str-4"), lit("str-5")], false)),
-            );
+        let st_x = Expr::GetIndexedField(GetIndexedField {
+            expr: Box::new(col("st")),
+            key: ScalarValue::Utf8(Some("x".to_string())),
+        });
+
+        let expected = col("i").gt(lit(3_i32)).and(st_x.lt_eq(lit(5.0_f64))).and(
+            col("s")
+                .eq(lit("str-4"))
+                .or(col("s").in_list(vec![lit("str-4"), lit("str-5")], false)),
+        );
 
         // double quotes
         let expr = planner
@@ -761,19 +501,19 @@ mod tests {
     fn test_sql_cast() {
         let cases = &[
             (
-                "x = cast('2021-01-01 00:00:00' as timestamp)",
+                "x = arrow_cast('2021-01-01 00:00:00', 'Timestamp(Microsecond, None)')",
                 ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
             ),
             (
-                "x = cast('2021-01-01 00:00:00' as timestamp(0))",
+                "x = arrow_cast('2021-01-01 00:00:00', 'Timestamp(Second, None)')",
                 ArrowDataType::Timestamp(TimeUnit::Second, None),
             ),
             (
-                "x = cast('2021-01-01 00:00:00.123' as timestamp(9))",
+                "x = arrow_cast('2021-01-01 00:00:00.123', 'Timestamp(Nanosecond, None)')",
                 ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
             ),
             (
-                "x = cast('2021-01-01 00:00:00.123' as datetime(9))",
+                "x = arrow_cast('2021-01-01 00:00:00.123', 'Timestamp(Nanosecond, None)')",
                 ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
             ),
             ("x = cast('2021-01-01' as date)", ArrowDataType::Date32),
@@ -815,7 +555,10 @@ mod tests {
                 .next()
                 .unwrap();
             // Remove any quote marks
-            let expected_value_str = expected_value_str.trim_matches('\'');
+            let expected_value_str = expected_value_str
+                .split('\'')
+                .nth(1)
+                .unwrap_or(expected_value_str);
 
             match expr {
                 Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
@@ -842,15 +585,15 @@ mod tests {
     fn test_sql_literals() {
         let cases = &[
             (
-                "x = timestamp '2021-01-01 00:00:00'",
+                "x = arrow_cast(timestamp '2021-01-01 00:00:00', 'Timestamp(Microsecond, None)')",
                 ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
             ),
             (
-                "x = timestamp(0) '2021-01-01 00:00:00'",
+                "x = arrow_cast(timestamp '2021-01-01 00:00:00', 'Timestamp(Second, None)')",
                 ArrowDataType::Timestamp(TimeUnit::Second, None),
             ),
             (
-                "x = timestamp(9) '2021-01-01 00:00:00.123'",
+                "x = timestamp '2021-01-01 00:00:00.123'",
                 ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
             ),
             ("x = date '2021-01-01'", ArrowDataType::Date32),
@@ -875,6 +618,15 @@ mod tests {
                             Expr::Literal(ScalarValue::Utf8(Some(value_str))) => {
                                 assert_eq!(value_str, expected_value_str);
                             }
+                            // For timestamps we get an outer arrow_cast cast and an inner literal parsing cast
+                            Expr::Cast(inner_cast) => match inner_cast.expr.as_ref() {
+                                Expr::Literal(ScalarValue::Utf8(Some(value_str))) => {
+                                    assert_eq!(value_str, expected_value_str);
+                                }
+                                _ => {
+                                    panic!("Expected inner timestamp cast to be applied to literal")
+                                }
+                            },
                             _ => panic!("Expected cast to be applied to literal"),
                         }
                         assert_eq!(data_type, expected_data_type);
