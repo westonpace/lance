@@ -1,3 +1,4 @@
+#![feature(core_intrinsics)]
 // Copyright 2023 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");

@@ -24,8 +24,9 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     RecordBatchStream as DFRecordBatchStream, SendableRecordBatchStream, Statistics,
 };
+use futures::future::BoxFuture;
 use futures::stream::Stream;
-use futures::FutureExt;
+use futures::{Future, FutureExt};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
@@ -246,43 +247,66 @@ pub struct KNNIndexStream {
 }
 
 impl KNNIndexStream {
+    async fn thread_task(
+        dataset: Arc<Dataset>,
+        query: Query,
+        name: String,
+        tx: tokio::sync::mpsc::Sender<datafusion::error::Result<RecordBatch>>,
+    ) {
+        let maybe_pre_filter = PreFilter::try_new(dataset.clone()).await;
+        if maybe_pre_filter.is_err() {
+            let error = maybe_pre_filter.unwrap_err();
+            tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
+                "Failed to load prefilter: {error}"
+            ))))
+            .await
+            .expect("KNNIndex failed to send message");
+            return;
+        }
+        let pre_filter = maybe_pre_filter.unwrap();
+
+        let index = match open_index(dataset.clone(), &query.column, &name).await {
+            Ok(idx) => idx,
+            Err(e) => {
+                tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
+                    "Failed to open vector index: {name}: {e}"
+                ))))
+                .await
+                .expect("KNNFlat failed to send message");
+                return;
+            }
+        };
+        let result = match index.search(&query, &pre_filter).await {
+            Ok(b) => b,
+            Err(e) => {
+                tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
+                    "Failed to compute distances: {e}"
+                ))))
+                .await
+                .expect("KNNIndex failed to send message");
+                return;
+            }
+        };
+
+        if !tx.is_closed() {
+            if let Err(e) = tx.send(Ok(result)).await {
+                eprintln!("KNNIndex tx.send error: {e}")
+            };
+        }
+        drop(tx);
+    }
+
     pub fn new(dataset: Arc<Dataset>, index_name: &str, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
-        let q = query.clone();
-        let name = index_name.to_string();
-        let bg_thread = tokio::spawn(async move {
-            let index = match open_index(dataset.clone(), &q.column, &name).await {
-                Ok(idx) => idx,
-                Err(e) => {
-                    tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to open vector index: {name}: {e}"
-                    ))))
-                    .await
-                    .expect("KNNFlat failed to send message");
-                    return;
-                }
-            };
-            let pre_filter = PreFilter::new(dataset);
-            let result = match index.search(&q, &pre_filter).await {
-                Ok(b) => b,
-                Err(e) => {
-                    tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to compute distances: {e}"
-                    ))))
-                    .await
-                    .expect("KNNIndex failed to send message");
-                    return;
-                }
-            };
+        let index_name = index_name.to_string();
+        let query = query.clone();
+        let dataset = dataset.clone();
 
-            if !tx.is_closed() {
-                if let Err(e) = tx.send(Ok(result)).await {
-                    eprintln!("KNNIndex tx.send error: {e}")
-                };
-            }
-            drop(tx);
-        });
+        let task: Pin<Box<dyn Future<Output = ()> + Send>> =
+            Box::pin(async move { Self::thread_task(dataset, query, index_name, tx).await });
+
+        let bg_thread = tokio::spawn(task);
 
         Self {
             rx,

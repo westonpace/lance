@@ -19,6 +19,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::intrinsics::unlikely;
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
@@ -26,17 +27,89 @@ use futures::{StreamExt, TryStreamExt};
 
 use crate::error::Result;
 use crate::io::deletion::DeletionVector;
-use crate::Dataset;
+use crate::{Dataset, Error};
 
 /// Filter out row ids that we know are not relevant to the query. This currently
 /// is just deleted rows.
+#[derive(Debug)]
 pub struct PreFilter {
     dataset: Arc<Dataset>,
+    deletion_vecs: Vec<(usize, Option<Arc<DeletionVector>>)>,
+}
+
+pub struct PreFilt<'a, I: Iterator, F: Fn(&I::Item) -> (usize, usize)> {
+    iter: I,
+    map_fn: F,
+    pre_filter: &'a PreFilter,
+    cur_frag_idx: usize,
+}
+
+impl<'a, I: Iterator, F: Fn(&I::Item) -> (usize, usize)> Iterator for PreFilt<'a, I, F> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(item) = self.iter.next() {
+            let (frag_id, row_id) = (self.map_fn)(&item);
+            while self.cur_frag_idx < self.pre_filter.deletion_vecs.len()
+                && self.pre_filter.deletion_vecs[self.cur_frag_idx].0 < frag_id
+            {
+                self.cur_frag_idx += 1;
+            }
+            let (cur_frag_id, deletion_vec) = &self.pre_filter.deletion_vecs[self.cur_frag_idx];
+            if unlikely(*cur_frag_id != frag_id) {
+                continue;
+            }
+            if let Some(deletion_vec) = deletion_vec {
+                if unlikely(deletion_vec.contains(row_id as u32)) {
+                    continue;
+                }
+            }
+            return Some(item);
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, self.iter.size_hint().1)
+    }
 }
 
 impl PreFilter {
-    pub fn new(dataset: Arc<Dataset>) -> Self {
-        Self { dataset }
+    pub async fn try_new(dataset: Arc<Dataset>) -> Result<Self> {
+        let fragments = dataset.get_fragments();
+        // let deletion_vecs = futures::stream::iter(fragments.iter().map(|f| async move {
+        //     let id = f.id();
+        //     let dv = f.get_deletion_vector().await?;
+        //     Ok::<_, Error>((id, dv))
+        // }))
+        // .buffered(num_cpus::get())
+        // .try_collect::<Vec<_>>()
+        // .await?;
+        let deletion_vecs = futures::stream::iter(fragments.iter())
+            .then(|f| async move {
+                let id = f.id();
+                let dv = f.get_deletion_vector().await?;
+                Ok::<_, Error>((id, dv))
+            })
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(Self {
+            dataset,
+            deletion_vecs,
+        })
+    }
+
+    pub fn apply<I: Iterator, F: Fn(&I::Item) -> (usize, usize)>(
+        &self,
+        iter: I,
+        map_fn: F,
+    ) -> PreFilt<I, F> {
+        PreFilt {
+            iter,
+            map_fn,
+            pre_filter: self,
+            cur_frag_idx: 0,
+        }
     }
 
     /// Check whether a single row id should be included in the query.
