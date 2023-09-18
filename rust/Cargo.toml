@@ -1,5 +1,11 @@
 [workspace]
-members = ["lance-arrow", "lance-linalg", "lance-testing", "lance"]
+members = [
+    "lance-arrow",
+    "lance-datagen",
+    "lance-linalg",
+    "lance-testing",
+    "lance",
+]
 # Python package needs to be built by maturin.
 resolver = "2"
 
@@ -16,17 +22,18 @@ keywords = [
     "data-science",
     "machine-learning",
     "apache-arrow",
-    "data-analytics"
+    "data-analytics",
 ]
 categories = [
     "database-implementations",
     "data-structures",
     "development-tools",
-    "science"
+    "science",
 ]
 
 [workspace.dependencies]
 lance-arrow = { version = "=0.7.5", path = "./lance-arrow" }
+lance-datagen = { version = "=0.7.5", path = "./lance-datagen" }
 lance-linalg = { version = "=0.7.5", path = "./lance-linalg" }
 lance-testing = { version = "=0.7.5", path = "./lance-testing" }
 # Note that this one does not include pyarrow
@@ -36,13 +43,12 @@ arrow-array = "43.0"
 arrow-buffer = "43.0"
 arrow-cast = "43.0"
 arrow-data = "43.0"
-arrow-ipc = "43.0"
 arrow-ord = "43.0"
 arrow-row = "43.0"
 arrow-schema = "43.0"
 arrow-select = "43.0"
 half = { "version" = "=2.2.1", default-features = false, features = [
-    "num-traits"
+    "num-traits",
 ] }
 approx = "0.5.1"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
