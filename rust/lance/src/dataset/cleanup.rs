@@ -175,8 +175,8 @@ impl<'a> CleanupTask<'a> {
                 .deletion_file
                 .as_ref()
                 .map(|delfile| deletion_file_path(&self.dataset.base, fragment.id, delfile));
-            if delpath.is_some() {
-                let relative_path = remove_prefix(&delpath.unwrap(), &self.dataset.base);
+            if let Some(delpath) = delpath {
+                let relative_path = remove_prefix(&delpath, &self.dataset.base);
                 referenced_files.delete_paths.insert(relative_path);
             }
         }

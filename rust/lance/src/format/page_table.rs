@@ -121,7 +121,7 @@ impl PageTable {
     pub fn set(&mut self, column: i32, batch: i32, page_info: PageInfo) {
         self.pages
             .entry(column)
-            .or_insert_with(BTreeMap::default)
+            .or_default()
             .insert(batch, page_info);
     }
 

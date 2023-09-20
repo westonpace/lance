@@ -88,14 +88,14 @@ impl PartialEq for VertexWithDistance {
 
 impl Eq for VertexWithDistance {}
 
-impl PartialOrd for VertexWithDistance {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.distance.partial_cmp(&other.distance)
-    }
-}
-
 impl Ord for VertexWithDistance {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.distance.cmp(&other.distance)
+    }
+}
+
+impl PartialOrd for VertexWithDistance {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
