@@ -14,6 +14,7 @@ lance-arrow = { workspace = true }
 
 arrow = { workspace = true }
 arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
 arrow-schema = { workspace = true }
 paste = "1.0.14"
 rand.workspace = true

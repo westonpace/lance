@@ -1,7 +1,7 @@
 use std::{iter::{TrustedLen, self}, marker::PhantomData, sync::Arc};
 
 use arrow::buffer::{Buffer, OffsetBuffer};
-use arrow_array::{RecordBatch, RecordBatchReader, types::{ByteArrayType, BinaryType, Utf8Type}};
+use arrow_array::{RecordBatch, RecordBatchReader, types::{ByteArrayType, BinaryType, Utf8Type, ArrowDictionaryKeyType}};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use lance_arrow::FixedSizeListArrayExt;
 use rand::{SeedableRng, RngCore};
@@ -319,6 +319,51 @@ impl<T: ByteArrayType> ArrayGenerator for FixedBinaryGenerator<T> {
     }
 }
 
+pub struct DictionaryGenerator<K: ArrowDictionaryKeyType> {
+    generator: Box<dyn ArrayGenerator>,
+    name: Option<String>,
+    data_type: DataType,
+    key_type: PhantomData<K>,
+    key_width: u64,
+}
+
+impl<K: ArrowDictionaryKeyType> DictionaryGenerator<K> {
+    fn new(generator: Box<dyn ArrayGenerator>, name: Option<String>) -> Self {
+        let key_type = Box::new(K::DATA_TYPE.clone());
+        let key_width = key_type.primitive_width().expect("dictionary key types should have a known width") as u64;
+        let val_type = Box::new(generator.data_type().clone());
+        let dict_type = DataType::Dictionary(key_type, val_type);
+        Self {
+            generator,
+            name,
+            data_type: dict_type,
+            key_type: PhantomData,
+            key_width,
+        }
+    }
+}
+
+impl<K: ArrowDictionaryKeyType> ArrayGenerator for DictionaryGenerator<K> {
+
+    fn generate(&mut self, length: RowCount) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let underlying = self.generator.generate(length)?;
+        arrow_cast::cast::cast(&underlying, &self.data_type)
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        self.generator.element_size_bytes().map(|size_bytes| ByteCount::from(size_bytes.0 + self.key_width))
+    }
+
+}
+
 pub struct FixedSizeBatchGenerator {
     generators: Vec<Box<dyn ArrayGenerator>>,
     batch_size: RowCount,
@@ -441,6 +486,7 @@ impl BatchGeneratorBuilder {
 }
 
 pub mod array {
+    use arrow_array::{ArrowNativeTypeOp, PrimitiveArray};
     use arrow_array::types::{ArrowPrimitiveType, Utf8Type};
     use rand::Rng;
 
@@ -450,73 +496,18 @@ pub mod array {
         Box::new(CycleVectorGenerator::new(generator, dimension, None))
     }
 
-    pub trait HasOne {
-        fn one() -> Self;
-    }
-
-    impl HasOne for u8 {
-        fn one() -> Self {
-            1
-        }
-    }
-    impl HasOne for u16 {
-        fn one() -> Self {
-            1
-        }
-    }
-    impl HasOne for u32 {
-        fn one() -> Self {
-            1
-        }
-    }
-    impl HasOne for u64 {
-        fn one() -> Self {
-            1
-        }
-    }
-    impl HasOne for i8 {
-        fn one() -> Self {
-            1
-        }
-    }
-    impl HasOne for i16 {
-        fn one() -> Self {
-            1
-        }
-    }
-    impl HasOne for i32 {
-        fn one() -> Self {
-            1
-        }
-    }
-    impl HasOne for i64 {
-        fn one() -> Self {
-            1
-        }
-    }
-    impl HasOne for f32 {
-        fn one() -> Self {
-            1.0
-        }
-    }
-    impl HasOne for f64 {
-        fn one() -> Self {
-            1.0
-        }
-    }
-
-    pub fn step<ArrayType, DataType>() -> Box<dyn ArrayGenerator>
+    pub fn step<DataType>() -> Box<dyn ArrayGenerator>
     where
-        DataType::Native: Copy + Default + std::ops::AddAssign<DataType::Native> + HasOne + 'static,
-        ArrayType: arrow_array::Array + From<Vec<DataType::Native>> + 'static,
+        DataType::Native: Copy + Default + std::ops::AddAssign<DataType::Native> + 'static,
         DataType: ArrowPrimitiveType,
+        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
     {
         let mut x = DataType::Native::default();
-        Box::new(FnGen::<DataType::Native, ArrayType, _>::new_known_size(
+        Box::new(FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
             DataType::DATA_TYPE.clone(),
             move || {
                 let y = x;
-                x += DataType::Native::from(HasOne::one());
+                x += DataType::Native::from(DataType::Native::ONE);
                 y
             },
             None,
@@ -525,17 +516,17 @@ pub mod array {
         ))
     }
 
-    pub fn step_custom<ArrayType, DataType>(
+    pub fn step_custom<DataType>(
         start: DataType::Native,
         step: DataType::Native,
     ) -> Box<dyn ArrayGenerator>
     where
         DataType::Native: Copy + Default + std::ops::AddAssign<DataType::Native> + 'static,
-        ArrayType: arrow_array::Array + From<Vec<DataType::Native>> + 'static,
+        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
         DataType: ArrowPrimitiveType,
     {
         let mut x = start;
-        Box::new(FnGen::<DataType::Native, ArrayType, _>::new_known_size(
+        Box::new(FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
             DataType::DATA_TYPE.clone(),
             move || {
                 let y = x;
@@ -548,13 +539,13 @@ pub mod array {
         ))
     }
 
-    pub fn fill<ArrayType, DataType>(value: DataType::Native) -> Box<dyn ArrayGenerator>
+    pub fn fill<DataType>(value: DataType::Native) -> Box<dyn ArrayGenerator>
     where
         DataType::Native: Copy + 'static,
-        ArrayType: arrow_array::Array + From<Vec<DataType::Native>> + 'static,
         DataType: ArrowPrimitiveType,
+        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static
     {
-        Box::new(FnGen::<DataType::Native, ArrayType, _>::new_known_size(
+        Box::new(FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
             DataType::DATA_TYPE.clone(),
             move || value,
             None,
@@ -571,15 +562,15 @@ pub mod array {
         Box::new(FixedBinaryGenerator::<Utf8Type>::new(value.into_bytes(), None))
     }
 
-    pub fn rand<ArrayType, DataType>(seed: Seed) -> Box<dyn ArrayGenerator>
+    pub fn rand<DataType>(seed: Seed) -> Box<dyn ArrayGenerator>
     where
         DataType::Native: Copy + 'static,
-        ArrayType: arrow_array::Array + From<Vec<DataType::Native>> + 'static,
+        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
         DataType: ArrowPrimitiveType,
         rand::distributions::Standard: rand::distributions::Distribution<DataType::Native>,
     {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed.0);
-        Box::new(FnGen::<DataType::Native, ArrayType, _>::new_known_size(
+        Box::new(FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
             DataType::DATA_TYPE.clone(),
             move || rng.gen(),
             None,
@@ -588,14 +579,14 @@ pub mod array {
         ))
     }
 
-    pub fn rand_vec<ArrayType, DataType>(seed: Seed, dimension: Dimension) -> Box<dyn ArrayGenerator>
+    pub fn rand_vec<DataType>(seed: Seed, dimension: Dimension) -> Box<dyn ArrayGenerator>
     where
         DataType::Native: Copy + 'static,
-        ArrayType: arrow_array::Array + From<Vec<DataType::Native>> + 'static,
+        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
         DataType: ArrowPrimitiveType,
         rand::distributions::Standard: rand::distributions::Distribution<DataType::Native>
         {
-            let underlying = rand::<ArrayType, DataType>(seed);
+            let underlying = rand::<DataType>(seed);
             cycle_vec(underlying, dimension)
         }
 
@@ -605,6 +596,10 @@ pub mod array {
 
     pub fn rand_utf8(seed: Seed, bytes_per_element: ByteCount) -> Box<dyn ArrayGenerator> {
         Box::new(RandomBinaryGenerator::new(seed, bytes_per_element, None, true))
+    }
+
+    pub fn dict<K: ArrowDictionaryKeyType>(generator: Box<dyn ArrayGenerator>) -> Box<dyn ArrayGenerator> {
+        Box::new(DictionaryGenerator::<K>::new(generator, None))
     }
 }
 
@@ -624,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_step() {
-        let mut gen = array::step::<Int32Array, Int32Type>();
+        let mut gen = array::step::<Int32Type>();
         assert_eq!(
             *gen.generate(RowCount::from(5)).unwrap(),
             Int32Array::from_iter([0, 1, 2, 3, 4])
@@ -634,19 +629,19 @@ mod tests {
             Int32Array::from_iter([5, 6, 7, 8, 9])
         );
 
-        let mut gen = array::step::<Int8Array, Int8Type>();
+        let mut gen = array::step::<Int8Type>();
         assert_eq!(
             *gen.generate(RowCount::from(3)).unwrap(),
             Int8Array::from_iter([0, 1, 2])
         );
 
-        let mut gen = array::step::<Float32Array, Float32Type>();
+        let mut gen = array::step::<Float32Type>();
         assert_eq!(
             *gen.generate(RowCount::from(3)).unwrap(),
             Float32Array::from_iter([0.0, 1.0, 2.0])
         );
 
-        let mut gen = array::step_custom::<Int16Array, Int16Type>(4, 8);
+        let mut gen = array::step_custom::<Int16Type>(4, 8);
         assert_eq!(
             *gen.generate(RowCount::from(3)).unwrap(),
             Int16Array::from_iter([4, 12, 20])
@@ -659,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_fill() {
-        let mut gen = array::fill::<Int32Array, Int32Type>(42);
+        let mut gen = array::fill::<Int32Type>(42);
         assert_eq!(
             *gen.generate(RowCount::from(3)).unwrap(),
             Int32Array::from_iter([42, 42, 42])
@@ -682,7 +677,7 @@ mod tests {
 
     #[test]
     fn test_rng() {
-        let mut gen = array::rand::<Int32Array, Int32Type>(DEFAULT_SEED);
+        let mut gen = array::rand::<Int32Type>(DEFAULT_SEED);
         assert_eq!(
             *gen.generate(RowCount::from(3)).unwrap(),
             Int32Array::from_iter([-797553329, 1369325940, -69174021])

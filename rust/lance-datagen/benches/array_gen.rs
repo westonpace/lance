@@ -1,7 +1,4 @@
-use arrow_array::{
-    types::{Float32Type, Int16Type, Int32Type, Int64Type, Int8Type},
-    Float32Array, Int16Array, Int32Array, Int64Array, Int8Array,
-};
+use arrow_array::types::{Float32Type, Int16Type, Int32Type, Int64Type, Int8Type};
 use criterion::{
     criterion_group, criterion_main, measurement::Measurement, BenchmarkGroup, Criterion,
     Throughput,
@@ -44,16 +41,16 @@ fn bench_step_gen<M: Measurement>(c: &mut Criterion<M>) {
     let mut group = c.benchmark_group("step");
     group.throughput(Throughput::Bytes(BYTES_PER_BENCH));
     bench_gen(&mut group, "i8", || {
-        lance_datagen::array::step::<Int8Array, Int8Type>()
+        lance_datagen::array::step::<Int8Type>()
     });
     bench_gen(&mut group, "16", || {
-        lance_datagen::array::step::<Int16Array, Int16Type>()
+        lance_datagen::array::step::<Int16Type>()
     });
     bench_gen(&mut group, "i32", || {
-        lance_datagen::array::step::<Int32Array, Int32Type>()
+        lance_datagen::array::step::<Int32Type>()
     });
     bench_gen(&mut group, "i64", || {
-        lance_datagen::array::step::<Int64Array, Int64Type>()
+        lance_datagen::array::step::<Int64Type>()
     });
     group.finish();
 }
@@ -62,16 +59,16 @@ fn bench_fill_gen(c: &mut Criterion) {
     let mut group = c.benchmark_group("fill");
     group.throughput(Throughput::Bytes(BYTES_PER_BENCH));
     bench_gen(&mut group, "fill_i8", || {
-        lance_datagen::array::fill::<Int8Array, Int8Type>(42)
+        lance_datagen::array::fill::<Int8Type>(42)
     });
     bench_gen(&mut group, "fill_i16", || {
-        lance_datagen::array::fill::<Int16Array, Int16Type>(42)
+        lance_datagen::array::fill::<Int16Type>(42)
     });
     bench_gen(&mut group, "fill_i32", || {
-        lance_datagen::array::fill::<Int32Array, Int32Type>(42)
+        lance_datagen::array::fill::<Int32Type>(42)
     });
     bench_gen(&mut group, "fill_i64", || {
-        lance_datagen::array::fill::<Int64Array, Int64Type>(42)
+        lance_datagen::array::fill::<Int64Type>(42)
     });
     bench_gen(&mut group, "fill_varbin", || {
         lance_datagen::array::fill_varbin(vec![
@@ -89,16 +86,16 @@ fn bench_rand_gen(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(BYTES_PER_BENCH));
     let seed = lance_datagen::DEFAULT_SEED;
     bench_gen(&mut group, "rand_i8", || {
-        lance_datagen::array::rand::<Int8Array, Int8Type>(seed)
+        lance_datagen::array::rand::<Int8Type>(seed)
     });
     bench_gen(&mut group, "rand_i16", || {
-        lance_datagen::array::rand::<Int16Array, Int16Type>(seed)
+        lance_datagen::array::rand::<Int16Type>(seed)
     });
     bench_gen(&mut group, "rand_i32", || {
-        lance_datagen::array::rand::<Int32Array, Int32Type>(seed)
+        lance_datagen::array::rand::<Int32Type>(seed)
     });
     bench_gen(&mut group, "rand_i64", || {
-        lance_datagen::array::rand::<Int64Array, Int64Type>(seed)
+        lance_datagen::array::rand::<Int64Type>(seed)
     });
     bench_gen(&mut group, "rand_varbin", || {
         lance_datagen::array::rand_varbin(seed, ByteCount::from(12))
@@ -107,7 +104,13 @@ fn bench_rand_gen(c: &mut Criterion) {
         lance_datagen::array::rand_utf8(seed, ByteCount::from(12))
     });
     bench_gen(&mut group, "rand_vec", || {
-        lance_datagen::array::rand_vec::<Float32Array, Float32Type>(seed, Dimension::from(512))
+        lance_datagen::array::rand_vec::<Float32Type>(seed, Dimension::from(512))
+    });
+    bench_gen(&mut group, "rand_dict_i32_utf8", || {
+        lance_datagen::array::dict::<Int32Type>(lance_datagen::array::rand_utf8(
+            seed,
+            ByteCount::from(8),
+        ))
     });
     group.finish();
 }
