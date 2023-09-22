@@ -42,7 +42,6 @@ impl From<u32> for Dimension {
 pub trait ArrayGenerator {
     fn generate(&mut self, length: RowCount) -> Result<Arc<dyn arrow_array::Array>, ArrowError>;
     fn data_type(&self) -> &DataType;
-    fn name(&self) -> Option<&str>;
     fn element_size_bytes(&self) -> Option<ByteCount>;
 }
 
@@ -99,7 +98,6 @@ where
 {
     data_type: DataType,
     generator: F,
-    name: Option<String>,
     array_type: PhantomData<ArrayType>,
     repeat: u32,
     leftover: T,
@@ -115,14 +113,12 @@ where
     fn new_known_size(
         data_type: DataType,
         generator: F,
-        name: Option<String>,
         repeat: u32,
         element_size_bytes: ByteCount,
     ) -> Self {
         Self {
             data_type: data_type,
             generator,
-            name,
             array_type: PhantomData,
             repeat,
             leftover: T::default(),
@@ -161,10 +157,6 @@ where
         &self.data_type
     }
 
-    fn name(&self) -> Option<&str> {
-        self.name.as_deref()
-    }
-
     fn element_size_bytes(&self) -> Option<ByteCount> {
         self.element_size_bytes
     }
@@ -183,17 +175,15 @@ impl From<u64> for Seed {
 pub struct CycleVectorGenerator {
     underlying_gen: Box<dyn ArrayGenerator>,
     dimension: Dimension,
-    name: Option<String>,
     data_type: DataType,
 }
 
 impl CycleVectorGenerator {
-    pub fn new(underlying_gen: Box<dyn ArrayGenerator>, dimension: Dimension, name: Option<String>) -> Self {
+    pub fn new(underlying_gen: Box<dyn ArrayGenerator>, dimension: Dimension) -> Self {
         let data_type = DataType::FixedSizeList(Arc::new(Field::new("item", underlying_gen.data_type().clone(), true)), dimension.0 as i32);
         Self {
             underlying_gen,
             dimension,
-            name,
             data_type,
         }
     }
@@ -214,10 +204,6 @@ impl ArrayGenerator for CycleVectorGenerator {
         &self.data_type
     }
 
-    fn name(&self) -> Option<&str> {
-        self.name.as_deref()
-    }
-
     fn element_size_bytes(&self) -> Option<ByteCount> {
         self.underlying_gen.element_size_bytes().map(|byte_count| ByteCount::from(byte_count.0 * self.dimension.0 as u64))
     }
@@ -226,18 +212,16 @@ impl ArrayGenerator for CycleVectorGenerator {
 pub struct RandomBinaryGenerator {
     rng: rand_xoshiro::Xoshiro256PlusPlus,
     bytes_per_element: ByteCount,
-    name: Option<String>,
     scale_to_utf8: bool,
     data_type: DataType,
 }
 
 impl RandomBinaryGenerator {
-    pub fn new(seed: Seed, bytes_per_element: ByteCount, name: Option<String>, scale_to_utf8: bool) -> Self {
+    pub fn new(seed: Seed, bytes_per_element: ByteCount, scale_to_utf8: bool) -> Self {
         let rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed.0);
         Self {
             rng,
             bytes_per_element,
-            name,
             scale_to_utf8,
             data_type: if scale_to_utf8 { Utf8Type::DATA_TYPE.clone() } else { BinaryType::DATA_TYPE.clone() },
         }
@@ -268,10 +252,6 @@ impl ArrayGenerator for RandomBinaryGenerator {
         &self.data_type
     }
 
-    fn name(&self) -> Option<&str> {
-        self.name.as_deref()
-    }
-
     fn element_size_bytes(&self) -> Option<ByteCount> {
         // Not exactly correct since there are N + 1 4-byte offsets and this only counts N
         Some(ByteCount::from(self.bytes_per_element.0 + std::mem::size_of::<i32>() as u64))
@@ -281,16 +261,14 @@ impl ArrayGenerator for RandomBinaryGenerator {
 
 pub struct FixedBinaryGenerator<T: ByteArrayType> {
     value: Vec<u8>,
-    name: Option<String>,
     data_type: DataType,
     array_type: PhantomData<T>,
 }
 
 impl<T: ByteArrayType> FixedBinaryGenerator<T> {
-    pub fn new(value: Vec<u8>, name: Option<String>) -> Self {
+    pub fn new(value: Vec<u8>) -> Self {
         Self {
             value,
-            name,
             data_type: T::DATA_TYPE.clone(),
             array_type: PhantomData,
         }
@@ -309,10 +287,6 @@ impl<T: ByteArrayType> ArrayGenerator for FixedBinaryGenerator<T> {
         &self.data_type
     }
 
-    fn name(&self) -> Option<&str> {
-        self.name.as_deref()
-    }
-
     fn element_size_bytes(&self) -> Option<ByteCount> {
         // Not exactly correct since there are N + 1 4-byte offsets and this only counts N
         Some(ByteCount::from(self.value.len() as u64 + std::mem::size_of::<i32>() as u64))
@@ -321,21 +295,19 @@ impl<T: ByteArrayType> ArrayGenerator for FixedBinaryGenerator<T> {
 
 pub struct DictionaryGenerator<K: ArrowDictionaryKeyType> {
     generator: Box<dyn ArrayGenerator>,
-    name: Option<String>,
     data_type: DataType,
     key_type: PhantomData<K>,
     key_width: u64,
 }
 
 impl<K: ArrowDictionaryKeyType> DictionaryGenerator<K> {
-    fn new(generator: Box<dyn ArrayGenerator>, name: Option<String>) -> Self {
+    fn new(generator: Box<dyn ArrayGenerator>) -> Self {
         let key_type = Box::new(K::DATA_TYPE.clone());
         let key_width = key_type.primitive_width().expect("dictionary key types should have a known width") as u64;
         let val_type = Box::new(generator.data_type().clone());
         let dict_type = DataType::Dictionary(key_type, val_type);
         Self {
             generator,
-            name,
             data_type: dict_type,
             key_type: PhantomData,
             key_width,
@@ -354,10 +326,6 @@ impl<K: ArrowDictionaryKeyType> ArrayGenerator for DictionaryGenerator<K> {
         &self.data_type
     }
 
-    fn name(&self) -> Option<&str> {
-        self.name.as_deref()
-    }
-
     fn element_size_bytes(&self) -> Option<ByteCount> {
         self.generator.element_size_bytes().map(|size_bytes| ByteCount::from(size_bytes.0 + self.key_width))
     }
@@ -365,7 +333,7 @@ impl<K: ArrowDictionaryKeyType> ArrayGenerator for DictionaryGenerator<K> {
 }
 
 pub struct FixedSizeBatchGenerator {
-    generators: Vec<Box<dyn ArrayGenerator>>,
+    generators: Vec<(Option<String>, Box<dyn ArrayGenerator>)>,
     batch_size: RowCount,
     num_batches: BatchCount,
     schema: SchemaRef,
@@ -373,14 +341,15 @@ pub struct FixedSizeBatchGenerator {
 
 impl FixedSizeBatchGenerator {
     fn new(
-        generators: Vec<Box<dyn ArrayGenerator>>,
+        generators: Vec<(Option<String>, Box<dyn ArrayGenerator>)>,
         batch_size: RowCount,
         num_batches: BatchCount,
     ) -> Self {
         let mut fields = Vec::with_capacity(generators.len());
-        for (field_index, gen) in generators.iter().enumerate() {
+        for (field_index, field_gen) in generators.iter().enumerate() {
+            let (name, gen) = field_gen;
             let default_name = format!("field_{}", field_index);
-            let name = gen.name().unwrap_or(&default_name);
+            let name = name.clone().unwrap_or(default_name);
             fields.push(Field::new(name, gen.data_type().clone(), true));
         }
         let schema = Arc::new(Schema::new(fields));
@@ -394,7 +363,8 @@ impl FixedSizeBatchGenerator {
 
     fn gen_next(&mut self) -> Result<RecordBatch, ArrowError> {
         let mut arrays = Vec::with_capacity(self.generators.len());
-        for gen in self.generators.iter_mut() {
+        for field_gen in self.generators.iter_mut() {
+            let (_, gen) = field_gen;
             let arr = gen.generate(self.batch_size)?;
             arrays.push(arr);
         }
@@ -424,7 +394,7 @@ impl RecordBatchReader for FixedSizeBatchGenerator {
 
 #[derive(Default)]
 pub struct BatchGeneratorBuilder {
-    generators: Vec<Box<dyn ArrayGenerator>>,
+    generators: Vec<(Option<String>, Box<dyn ArrayGenerator>)>,
 }
 
 pub enum RoundingBehavior {
@@ -438,8 +408,8 @@ impl BatchGeneratorBuilder {
         Default::default()
     }
 
-    pub fn col(mut self, gen: Box<dyn ArrayGenerator>) -> Self {
-        self.generators.push(gen);
+    pub fn col(mut self, name: Option<String>, gen: Box<dyn ArrayGenerator>) -> Self {
+        self.generators.push((name, gen));
         self
     }
 
@@ -462,7 +432,7 @@ impl BatchGeneratorBuilder {
             .generators
             .iter()
             .map(|gen| 
-                gen.element_size_bytes().map(|byte_count| byte_count.0).ok_or(
+                gen.1.element_size_bytes().map(|byte_count| byte_count.0).ok_or(
                         ArrowError::NotYetImplemented("The function into_reader_bytes currently requires each array generator to have a fixed element size".to_string())
                 )
             )
@@ -487,13 +457,13 @@ impl BatchGeneratorBuilder {
 
 pub mod array {
     use arrow_array::{ArrowNativeTypeOp, PrimitiveArray};
-    use arrow_array::types::{ArrowPrimitiveType, Utf8Type};
+    use arrow_array::types::{ArrowPrimitiveType, Utf8Type, Int8Type, Int16Type, Int32Type, Int64Type, Float32Type, Float64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type};
     use rand::Rng;
 
     use super::*;
 
     pub fn cycle_vec(generator: Box<dyn ArrayGenerator>, dimension: Dimension) -> Box<dyn ArrayGenerator> {
-        Box::new(CycleVectorGenerator::new(generator, dimension, None))
+        Box::new(CycleVectorGenerator::new(generator, dimension))
     }
 
     pub fn step<DataType>() -> Box<dyn ArrayGenerator>
@@ -510,7 +480,6 @@ pub mod array {
                 x += DataType::Native::from(DataType::Native::ONE);
                 y
             },
-            None,
             1,
             DataType::DATA_TYPE.primitive_width().map(|width| ByteCount::from(width as u64)).expect("Primitive types should have a fixed width"),
         ))
@@ -533,7 +502,6 @@ pub mod array {
                 x += step;
                 y
             },
-            None,
             1,
             DataType::DATA_TYPE.primitive_width().map(|width| ByteCount::from(width as u64)).expect("Primitive types should have a fixed width"),
         ))
@@ -548,18 +516,17 @@ pub mod array {
         Box::new(FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
             DataType::DATA_TYPE.clone(),
             move || value,
-            None,
             1,
             DataType::DATA_TYPE.primitive_width().map(|width| ByteCount::from(width as u64)).expect("Primitive types should have a fixed width"),
         ))
     }
 
     pub fn fill_varbin(value: Vec<u8>) -> Box<dyn ArrayGenerator> {
-        Box::new(FixedBinaryGenerator::<BinaryType>::new(value, None))
+        Box::new(FixedBinaryGenerator::<BinaryType>::new(value))
     }
 
     pub fn fill_utf8(value: String) -> Box<dyn ArrayGenerator> {
-        Box::new(FixedBinaryGenerator::<Utf8Type>::new(value.into_bytes(), None))
+        Box::new(FixedBinaryGenerator::<Utf8Type>::new(value.into_bytes()))
     }
 
     pub fn rand<DataType>(seed: Seed) -> Box<dyn ArrayGenerator>
@@ -573,7 +540,6 @@ pub mod array {
         Box::new(FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
             DataType::DATA_TYPE.clone(),
             move || rng.gen(),
-            None,
             1,
             DataType::DATA_TYPE.primitive_width().map(|width| ByteCount::from(width as u64)).expect("Primitive types should have a fixed width"),
         ))
@@ -591,20 +557,61 @@ pub mod array {
         }
 
     pub fn rand_varbin(seed: Seed, bytes_per_element: ByteCount) -> Box<dyn ArrayGenerator> {
-        Box::new(RandomBinaryGenerator::new(seed, bytes_per_element, None, false))
+        Box::new(RandomBinaryGenerator::new(seed, bytes_per_element, false))
     }
 
     pub fn rand_utf8(seed: Seed, bytes_per_element: ByteCount) -> Box<dyn ArrayGenerator> {
-        Box::new(RandomBinaryGenerator::new(seed, bytes_per_element, None, true))
+        Box::new(RandomBinaryGenerator::new(seed, bytes_per_element, true))
+    }
+
+    pub fn rand_type(seed: Seed, data_type: &DataType) -> Box<dyn ArrayGenerator> {
+        match data_type {
+            DataType::Int8 => rand::<Int8Type>(seed),
+            DataType::Int16 => rand::<Int16Type>(seed),
+            DataType::Int32 => rand::<Int32Type>(seed),
+            DataType::Int64 => rand::<Int64Type>(seed),
+            DataType::UInt8 => rand::<UInt8Type>(seed),
+            DataType::UInt16 => rand::<UInt16Type>(seed),
+            DataType::UInt32 => rand::<UInt32Type>(seed),
+            DataType::UInt64 => rand::<UInt64Type>(seed),
+            DataType::Float32 => rand::<Float32Type>(seed),
+            DataType::Float64 => rand::<Float64Type>(seed),
+            DataType::Utf8 => rand_utf8(seed, ByteCount::from(12)),
+            DataType::Binary => rand_varbin(seed, ByteCount::from(12)),
+            DataType::Dictionary(key_type, value_type) => dict_type(rand_type(seed, value_type), key_type),
+            _ => unimplemented!(),
+        }
     }
 
     pub fn dict<K: ArrowDictionaryKeyType>(generator: Box<dyn ArrayGenerator>) -> Box<dyn ArrayGenerator> {
-        Box::new(DictionaryGenerator::<K>::new(generator, None))
+        Box::new(DictionaryGenerator::<K>::new(generator))
+    }
+
+    pub fn dict_type(generator: Box<dyn ArrayGenerator>, key_type: &DataType) -> Box<dyn ArrayGenerator> {
+        match key_type {
+            DataType::Int8 => dict::<Int8Type>(generator),
+            DataType::Int16 => dict::<Int16Type>(generator),
+            DataType::Int32 => dict::<Int32Type>(generator),
+            DataType::Int64 => dict::<Int64Type>(generator),
+            DataType::UInt8 => dict::<UInt8Type>(generator),
+            DataType::UInt16 => dict::<UInt16Type>(generator),
+            DataType::UInt32 => dict::<UInt32Type>(generator),
+            DataType::UInt64 => dict::<UInt64Type>(generator),
+            _ => unimplemented!(),
+        }
     }
 }
 
 pub fn gen() -> BatchGeneratorBuilder {
     BatchGeneratorBuilder::default()
+}
+
+pub fn rand(schema: &Schema) -> BatchGeneratorBuilder {
+    let mut builder = BatchGeneratorBuilder::default();
+    for field in schema.fields() {
+        builder = builder.col(Some(field.name().clone()), array::rand_type(DEFAULT_SEED, field.data_type()));
+    }
+    builder
 }
 
 #[cfg(test)]
@@ -692,5 +699,26 @@ mod tests {
         assert_eq!(
             *gen.generate(RowCount::from(3)).unwrap(),
             arrow_array::StringArray::from_iter_values(["`)7", "dom", "725"]));
+    }
+
+    #[test]
+    fn test_rand_schema() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Float32, true),
+            Field::new("d", DataType::Int32, true),
+            Field::new("e", DataType::Int32, true),
+        ]);
+        let rbr = rand(&schema).into_reader_bytes(ByteCount::from(1024*1024), BatchCount::from(8), RoundingBehavior::ExactOrErr).unwrap();
+        assert_eq!(*rbr.schema(), schema);
+
+        let batches = rbr.map(|val| val.unwrap()).collect::<Vec<_>>();
+        assert_eq!(batches.len(), 8);
+
+        for batch in batches {
+            assert_eq!(batch.num_rows(), 1024*1024/32);
+            assert_eq!(batch.num_columns(), 5);
+        }
     }
 }
