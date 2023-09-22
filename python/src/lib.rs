@@ -27,6 +27,7 @@ use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::ArrowError;
+use datagen::register_datagen;
 use dataset::optimize::{PyCompaction, PyCompactionMetrics, PyCompactionTask, PyRewriteResult};
 use env_logger::Env;
 use futures::StreamExt;
@@ -37,6 +38,7 @@ use pyo3::prelude::*;
 extern crate lazy_static;
 
 pub(crate) mod arrow;
+pub(crate) mod datagen;
 pub(crate) mod dataset;
 pub(crate) mod errors;
 pub(crate) mod executor;
@@ -64,7 +66,7 @@ lazy_static! {
 }
 
 #[pymodule]
-fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
+fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");
@@ -90,6 +92,7 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
     m.add_wrapped(wrap_pyfunction!(cleanup_partial_writes))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    register_datagen(py, m)?;
     Ok(())
 }
 

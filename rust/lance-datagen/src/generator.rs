@@ -1,10 +1,9 @@
 use std::{iter::{TrustedLen, self}, marker::PhantomData, sync::Arc};
 
-use arrow::buffer::{Buffer, OffsetBuffer};
-use arrow_array::{RecordBatch, RecordBatchReader, types::{ByteArrayType, BinaryType, Utf8Type, ArrowDictionaryKeyType}};
+use arrow::{buffer::{Buffer, OffsetBuffer, BooleanBuffer}, array::ArrayData};
+use arrow_array::{RecordBatch, RecordBatchReader, types::{ByteArrayType, BinaryType, Utf8Type, ArrowDictionaryKeyType}, FixedSizeListArray, Array, make_array};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use lance_arrow::FixedSizeListArrayExt;
-use rand::{SeedableRng, RngCore};
+use rand::{SeedableRng, RngCore, Rng};
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct RowCount(u64);
@@ -40,9 +39,104 @@ impl From<u32> for Dimension {
 }
 
 pub trait ArrayGenerator {
-    fn generate(&mut self, length: RowCount) -> Result<Arc<dyn arrow_array::Array>, ArrowError>;
+    fn generate(&mut self, length: RowCount, rng: &mut rand_xoshiro::Xoshiro256PlusPlus) -> Result<Arc<dyn arrow_array::Array>, ArrowError>;
     fn data_type(&self) -> &DataType;
     fn element_size_bytes(&self) -> Option<ByteCount>;
+}
+
+pub struct NullGenerator {
+    generator: Box<dyn ArrayGenerator>,
+    null_probability: f64,
+}
+
+impl ArrayGenerator for NullGenerator {
+
+    fn generate(&mut self, length: RowCount, rng: &mut rand_xoshiro::Xoshiro256PlusPlus) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let array = self.generator.generate(length, rng)?;
+        let data = array.to_data();
+
+        if self.null_probability < 0.0 || self.null_probability > 1.0 {
+            return Err(ArrowError::InvalidArgumentError(format!("null_probability must be between 0 and 1, got {}", self.null_probability)));
+        }
+
+        let (null_count, new_validity) = if self.null_probability == 0.0 {
+            if data.null_count() == 0 {
+                return Ok(array);
+            } else {
+                (0 as usize, None)
+            }
+        } else if self.null_probability == 1.0 {
+            if data.null_count() == data.len() {
+                return Ok(array);
+            } else {
+                let all_nulls = BooleanBuffer::new_unset(array.len());
+                (array.len(), Some(all_nulls.into_inner()))
+            }
+        } else {
+            let array_len = array.len();
+            let num_validity_bytes = array_len.div_ceil(8);
+            let mut null_count = 0;
+            // Sampling the RNG once per bit is kind of slow so we do this to sample once
+            // per byte.  We only get 8 bits of RNG resolution but that should be good enough.
+            let threshold = (self.null_probability * std::u8::MAX as f64) as u8;
+            let bytes = (0..num_validity_bytes).map(|byte_idx| {
+                let mut sample = rng.gen::<u64>();
+                let mut byte: u8 = 0;
+                for bit_idx in 0..8 {
+                    // We could probably overshoot and fill in extra bits with random data but
+                    // this is cleaner and that would mess up the null count
+                    byte <<= 1;
+                    let pos = byte_idx * 8 + (7 - bit_idx);
+                    if pos < array_len {
+                        let sample_piece = sample & 0xFF;
+                        let is_null = (sample_piece as u8) < threshold;
+                        byte |= (!is_null) as u8;
+                        null_count += is_null as usize;
+                    }
+                    sample >>= 8;
+                }
+                byte
+            }).collect::<Vec<_>>();
+            let new_validity = Buffer::from_iter(bytes);
+            (null_count, Some(new_validity))
+        };
+
+        unsafe {
+            let new_data = ArrayData::new_unchecked(
+                data.data_type().clone(),
+                data.len(),
+                Some(null_count),
+                new_validity,
+                data.offset(),
+                data.buffers().to_vec(),
+                data.child_data().into());
+            Ok(make_array(new_data))
+        }
+    }
+
+    fn data_type(&self) -> &DataType {
+        self.generator.data_type()
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        self.generator.element_size_bytes()
+    }
+}
+
+pub trait ArrayGeneratorExt {
+
+    fn with_nulls(self, null_probability: f64) -> Box<dyn ArrayGenerator>;
+
+}
+
+impl ArrayGeneratorExt for Box<dyn ArrayGenerator> {
+
+    fn with_nulls(self, null_probability: f64) -> Box<dyn ArrayGenerator> {
+        Box::new(NullGenerator {
+            generator: self,
+            null_probability,
+        })
+    }
 }
 
 pub struct NTimesIter<I: Iterator>
@@ -91,7 +185,7 @@ where
 {
 }
 
-pub struct FnGen<T, ArrayType, F: FnMut() -> T>
+pub struct FnGen<T, ArrayType, F: FnMut(&mut rand_xoshiro::Xoshiro256PlusPlus) -> T>
 where
     T: Copy + Default,
     ArrayType: arrow_array::Array + From<Vec<T>>,
@@ -105,7 +199,7 @@ where
     element_size_bytes: Option<ByteCount>,
 }
 
-impl<T, ArrayType, F: FnMut() -> T> FnGen<T, ArrayType, F>
+impl<T, ArrayType, F: FnMut(&mut rand_xoshiro::Xoshiro256PlusPlus) -> T> FnGen<T, ArrayType, F>
 where
     T: Copy + Default,
     ArrayType: arrow_array::Array + From<Vec<T>>,
@@ -128,13 +222,13 @@ where
     }
 }
 
-impl<T, ArrayType, F: FnMut() -> T> ArrayGenerator for FnGen<T, ArrayType, F>
+impl<T, ArrayType, F: FnMut(&mut rand_xoshiro::Xoshiro256PlusPlus) -> T> ArrayGenerator for FnGen<T, ArrayType, F>
 where
     T: Copy + Default,
     ArrayType: arrow_array::Array + From<Vec<T>> + 'static,
 {
-    fn generate(&mut self, length: RowCount) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
-        let iter = (0..length.0).map(|_| (self.generator)());
+    fn generate(&mut self, length: RowCount, rng: &mut rand_xoshiro::Xoshiro256PlusPlus) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let iter = (0..length.0).map(|_| (self.generator)(rng));
         let values = if self.repeat > 1 {
             Vec::from_iter(
                 NTimesIter {
@@ -191,12 +285,13 @@ impl CycleVectorGenerator {
 
 impl ArrayGenerator for CycleVectorGenerator {
 
-    fn generate(&mut self, length: RowCount) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
-        let values = self.underlying_gen.generate(RowCount::from(length.0 * self.dimension.0 as u64))?;
-        let array = <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
-            values,
-            self.dimension.0 as i32,
-        )?;
+    fn generate(&mut self, length: RowCount, rng: &mut rand_xoshiro::Xoshiro256PlusPlus) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let values = self.underlying_gen.generate(RowCount::from(length.0 * self.dimension.0 as u64), rng)?;
+        let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+        let values = Arc::new(values);
+
+        let array = FixedSizeListArray::try_new(field, self.dimension.0 as i32, values, None)?;
+
         Ok(Arc::new(array))
     }
 
@@ -210,17 +305,14 @@ impl ArrayGenerator for CycleVectorGenerator {
 }
 
 pub struct RandomBinaryGenerator {
-    rng: rand_xoshiro::Xoshiro256PlusPlus,
     bytes_per_element: ByteCount,
     scale_to_utf8: bool,
     data_type: DataType,
 }
 
 impl RandomBinaryGenerator {
-    pub fn new(seed: Seed, bytes_per_element: ByteCount, scale_to_utf8: bool) -> Self {
-        let rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed.0);
+    pub fn new(bytes_per_element: ByteCount, scale_to_utf8: bool) -> Self {
         Self {
-            rng,
             bytes_per_element,
             scale_to_utf8,
             data_type: if scale_to_utf8 { Utf8Type::DATA_TYPE.clone() } else { BinaryType::DATA_TYPE.clone() },
@@ -230,10 +322,10 @@ impl RandomBinaryGenerator {
 
 impl ArrayGenerator for RandomBinaryGenerator {
 
-    fn generate(&mut self, length: RowCount) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+    fn generate(&mut self, length: RowCount, rng: &mut rand_xoshiro::Xoshiro256PlusPlus) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
         let mut bytes = Vec::new();
         bytes.resize((self.bytes_per_element.0 * length.0) as usize, 0);
-        self.rng.fill_bytes(&mut bytes);
+        rng.fill_bytes(&mut bytes);
         if self.scale_to_utf8 {
             // This doesn't give us the full UTF-8 range and it isn't statistically correct but
             // it's fast and probably good enough for most cases
@@ -277,7 +369,7 @@ impl<T: ByteArrayType> FixedBinaryGenerator<T> {
 
 impl<T: ByteArrayType> ArrayGenerator for FixedBinaryGenerator<T> {
 
-    fn generate(&mut self, length: RowCount) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+    fn generate(&mut self, length: RowCount, _: &mut rand_xoshiro::Xoshiro256PlusPlus) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
         let bytes = Buffer::from(Vec::from_iter(self.value.iter().cycle().take((length.0 * self.value.len() as u64) as usize).copied()));
         let offsets = OffsetBuffer::from_lengths(iter::repeat(self.value.len()).take(length.0 as usize));
         Ok(Arc::new(arrow_array::GenericByteArray::<T>::new(offsets, bytes, None)))
@@ -317,8 +409,8 @@ impl<K: ArrowDictionaryKeyType> DictionaryGenerator<K> {
 
 impl<K: ArrowDictionaryKeyType> ArrayGenerator for DictionaryGenerator<K> {
 
-    fn generate(&mut self, length: RowCount) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
-        let underlying = self.generator.generate(length)?;
+    fn generate(&mut self, length: RowCount, rng: &mut rand_xoshiro::Xoshiro256PlusPlus) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let underlying = self.generator.generate(length, rng)?;
         arrow_cast::cast::cast(&underlying, &self.data_type)
     }
 
@@ -333,7 +425,8 @@ impl<K: ArrowDictionaryKeyType> ArrayGenerator for DictionaryGenerator<K> {
 }
 
 pub struct FixedSizeBatchGenerator {
-    generators: Vec<(Option<String>, Box<dyn ArrayGenerator>)>,
+    rng: rand_xoshiro::Xoshiro256PlusPlus,
+    generators: Vec<Box<dyn ArrayGenerator>>,
     batch_size: RowCount,
     num_batches: BatchCount,
     schema: SchemaRef,
@@ -344,6 +437,8 @@ impl FixedSizeBatchGenerator {
         generators: Vec<(Option<String>, Box<dyn ArrayGenerator>)>,
         batch_size: RowCount,
         num_batches: BatchCount,
+        seed: Option<Seed>,
+        default_null_probability: Option<f64>,
     ) -> Self {
         let mut fields = Vec::with_capacity(generators.len());
         for (field_index, field_gen) in generators.iter().enumerate() {
@@ -352,8 +447,13 @@ impl FixedSizeBatchGenerator {
             let name = name.clone().unwrap_or(default_name);
             fields.push(Field::new(name, gen.data_type().clone(), true));
         }
+        let mut generators = generators.into_iter().map(|(_, gen)| gen).collect::<Vec<_>>();
+        if let Some(null_probability) = default_null_probability {
+            generators = generators.into_iter().map(|gen| gen.with_nulls(null_probability)).collect();
+        }
         let schema = Arc::new(Schema::new(fields));
         Self {
+            rng: rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed.map(|s| s.0).unwrap_or(DEFAULT_SEED.0)),
             generators,
             batch_size,
             num_batches,
@@ -363,9 +463,8 @@ impl FixedSizeBatchGenerator {
 
     fn gen_next(&mut self) -> Result<RecordBatch, ArrowError> {
         let mut arrays = Vec::with_capacity(self.generators.len());
-        for field_gen in self.generators.iter_mut() {
-            let (_, gen) = field_gen;
-            let arr = gen.generate(self.batch_size)?;
+        for gen in self.generators.iter_mut() {
+            let arr = gen.generate(self.batch_size, &mut self.rng)?;
             arrays.push(arr);
         }
         self.num_batches.0 -= 1;
@@ -395,6 +494,8 @@ impl RecordBatchReader for FixedSizeBatchGenerator {
 #[derive(Default)]
 pub struct BatchGeneratorBuilder {
     generators: Vec<(Option<String>, Box<dyn ArrayGenerator>)>,
+    default_null_probability: Option<f64>,
+    seed: Option<Seed>,
 }
 
 pub enum RoundingBehavior {
@@ -408,6 +509,13 @@ impl BatchGeneratorBuilder {
         Default::default()
     }
 
+    pub fn new_with_seed(seed: Seed) -> Self {
+        Self {
+            seed: Some(seed),
+            ..Default::default()
+        }
+    }
+
     pub fn col(mut self, name: Option<String>, gen: Box<dyn ArrayGenerator>) -> Self {
         self.generators.push((name, gen));
         self
@@ -419,7 +527,7 @@ impl BatchGeneratorBuilder {
         batch_size: RowCount,
         num_batches: BatchCount,
     ) -> impl RecordBatchReader {
-        FixedSizeBatchGenerator::new(self.generators, batch_size, num_batches)
+        FixedSizeBatchGenerator::new(self.generators, batch_size, num_batches, self.seed, self.default_null_probability)
     }
 
     pub fn into_reader_bytes(
@@ -453,6 +561,14 @@ impl BatchGeneratorBuilder {
         }
         Ok(self.into_reader_rows(num_rows, num_batches))
     }
+
+    pub fn with_seed(&mut self, seed: Seed) {
+        self.seed = Some(seed);
+    }
+
+    pub fn with_nulls(&mut self, default_null_probability: f64) {
+        self.default_null_probability = Some(default_null_probability);
+    }
 }
 
 pub mod array {
@@ -475,7 +591,7 @@ pub mod array {
         let mut x = DataType::Native::default();
         Box::new(FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
             DataType::DATA_TYPE.clone(),
-            move || {
+            move |_| {
                 let y = x;
                 x += DataType::Native::from(DataType::Native::ONE);
                 y
@@ -497,7 +613,7 @@ pub mod array {
         let mut x = start;
         Box::new(FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
             DataType::DATA_TYPE.clone(),
-            move || {
+            move |_| {
                 let y = x;
                 x += step;
                 y
@@ -515,7 +631,7 @@ pub mod array {
     {
         Box::new(FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
             DataType::DATA_TYPE.clone(),
-            move || value,
+            move |_| value,
             1,
             DataType::DATA_TYPE.primitive_width().map(|width| ByteCount::from(width as u64)).expect("Primitive types should have a fixed width"),
         ))
@@ -529,56 +645,55 @@ pub mod array {
         Box::new(FixedBinaryGenerator::<Utf8Type>::new(value.into_bytes()))
     }
 
-    pub fn rand<DataType>(seed: Seed) -> Box<dyn ArrayGenerator>
+    pub fn rand<DataType>() -> Box<dyn ArrayGenerator>
     where
         DataType::Native: Copy + 'static,
         PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
         DataType: ArrowPrimitiveType,
         rand::distributions::Standard: rand::distributions::Distribution<DataType::Native>,
     {
-        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed.0);
         Box::new(FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
             DataType::DATA_TYPE.clone(),
-            move || rng.gen(),
+            move |rng| rng.gen(),
             1,
             DataType::DATA_TYPE.primitive_width().map(|width| ByteCount::from(width as u64)).expect("Primitive types should have a fixed width"),
         ))
     }
 
-    pub fn rand_vec<DataType>(seed: Seed, dimension: Dimension) -> Box<dyn ArrayGenerator>
+    pub fn rand_vec<DataType>(dimension: Dimension) -> Box<dyn ArrayGenerator>
     where
         DataType::Native: Copy + 'static,
         PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
         DataType: ArrowPrimitiveType,
         rand::distributions::Standard: rand::distributions::Distribution<DataType::Native>
         {
-            let underlying = rand::<DataType>(seed);
+            let underlying = rand::<DataType>();
             cycle_vec(underlying, dimension)
         }
 
-    pub fn rand_varbin(seed: Seed, bytes_per_element: ByteCount) -> Box<dyn ArrayGenerator> {
-        Box::new(RandomBinaryGenerator::new(seed, bytes_per_element, false))
+    pub fn rand_varbin(bytes_per_element: ByteCount) -> Box<dyn ArrayGenerator> {
+        Box::new(RandomBinaryGenerator::new(bytes_per_element, false))
     }
 
-    pub fn rand_utf8(seed: Seed, bytes_per_element: ByteCount) -> Box<dyn ArrayGenerator> {
-        Box::new(RandomBinaryGenerator::new(seed, bytes_per_element, true))
+    pub fn rand_utf8(bytes_per_element: ByteCount) -> Box<dyn ArrayGenerator> {
+        Box::new(RandomBinaryGenerator::new(bytes_per_element, true))
     }
 
-    pub fn rand_type(seed: Seed, data_type: &DataType) -> Box<dyn ArrayGenerator> {
+    pub fn rand_type(data_type: &DataType) -> Box<dyn ArrayGenerator> {
         match data_type {
-            DataType::Int8 => rand::<Int8Type>(seed),
-            DataType::Int16 => rand::<Int16Type>(seed),
-            DataType::Int32 => rand::<Int32Type>(seed),
-            DataType::Int64 => rand::<Int64Type>(seed),
-            DataType::UInt8 => rand::<UInt8Type>(seed),
-            DataType::UInt16 => rand::<UInt16Type>(seed),
-            DataType::UInt32 => rand::<UInt32Type>(seed),
-            DataType::UInt64 => rand::<UInt64Type>(seed),
-            DataType::Float32 => rand::<Float32Type>(seed),
-            DataType::Float64 => rand::<Float64Type>(seed),
-            DataType::Utf8 => rand_utf8(seed, ByteCount::from(12)),
-            DataType::Binary => rand_varbin(seed, ByteCount::from(12)),
-            DataType::Dictionary(key_type, value_type) => dict_type(rand_type(seed, value_type), key_type),
+            DataType::Int8 => rand::<Int8Type>(),
+            DataType::Int16 => rand::<Int16Type>(),
+            DataType::Int32 => rand::<Int32Type>(),
+            DataType::Int64 => rand::<Int64Type>(),
+            DataType::UInt8 => rand::<UInt8Type>(),
+            DataType::UInt16 => rand::<UInt16Type>(),
+            DataType::UInt32 => rand::<UInt32Type>(),
+            DataType::UInt64 => rand::<UInt64Type>(),
+            DataType::Float32 => rand::<Float32Type>(),
+            DataType::Float64 => rand::<Float64Type>(),
+            DataType::Utf8 => rand_utf8(ByteCount::from(12)),
+            DataType::Binary => rand_varbin(ByteCount::from(12)),
+            DataType::Dictionary(key_type, value_type) => dict_type(rand_type(value_type), key_type),
             _ => unimplemented!(),
         }
     }
@@ -609,7 +724,7 @@ pub fn gen() -> BatchGeneratorBuilder {
 pub fn rand(schema: &Schema) -> BatchGeneratorBuilder {
     let mut builder = BatchGeneratorBuilder::default();
     for field in schema.fields() {
-        builder = builder.col(Some(field.name().clone()), array::rand_type(DEFAULT_SEED, field.data_type()));
+        builder = builder.col(Some(field.name().clone()), array::rand_type(field.data_type()));
     }
     builder
 }
@@ -626,79 +741,111 @@ mod tests {
 
     #[test]
     fn test_step() {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
         let mut gen = array::step::<Int32Type>();
         assert_eq!(
-            *gen.generate(RowCount::from(5)).unwrap(),
+            *gen.generate(RowCount::from(5), &mut rng).unwrap(),
             Int32Array::from_iter([0, 1, 2, 3, 4])
         );
         assert_eq!(
-            *gen.generate(RowCount::from(5)).unwrap(),
+            *gen.generate(RowCount::from(5), &mut rng).unwrap(),
             Int32Array::from_iter([5, 6, 7, 8, 9])
         );
 
         let mut gen = array::step::<Int8Type>();
         assert_eq!(
-            *gen.generate(RowCount::from(3)).unwrap(),
+            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
             Int8Array::from_iter([0, 1, 2])
         );
 
         let mut gen = array::step::<Float32Type>();
         assert_eq!(
-            *gen.generate(RowCount::from(3)).unwrap(),
+            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
             Float32Array::from_iter([0.0, 1.0, 2.0])
         );
 
         let mut gen = array::step_custom::<Int16Type>(4, 8);
         assert_eq!(
-            *gen.generate(RowCount::from(3)).unwrap(),
+            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
             Int16Array::from_iter([4, 12, 20])
         );
         assert_eq!(
-            *gen.generate(RowCount::from(2)).unwrap(),
+            *gen.generate(RowCount::from(2), &mut rng).unwrap(),
             Int16Array::from_iter([28, 36])
         );
     }
 
     #[test]
     fn test_fill() {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
         let mut gen = array::fill::<Int32Type>(42);
         assert_eq!(
-            *gen.generate(RowCount::from(3)).unwrap(),
+            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
             Int32Array::from_iter([42, 42, 42])
         );
         assert_eq!(
-            *gen.generate(RowCount::from(3)).unwrap(),
+            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
             Int32Array::from_iter([42, 42, 42])
         );
 
         let mut gen = array::fill_varbin(vec![0, 1, 2]);
-        assert_eq!(*gen.generate(RowCount::from(3)).unwrap(),
+        assert_eq!(*gen.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::BinaryArray::from_iter_values(["\x00\x01\x02", "\x00\x01\x02", "\x00\x01\x02"])
         );
 
         let mut gen = array::fill_utf8("xyz".to_string());
-        assert_eq!(*gen.generate(RowCount::from(3)).unwrap(),
+        assert_eq!(*gen.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::StringArray::from_iter_values(["xyz", "xyz", "xyz"])
         );
     }
 
     #[test]
     fn test_rng() {
-        let mut gen = array::rand::<Int32Type>(DEFAULT_SEED);
+        // Note: these tests are heavily dependent on the default seed.
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+        let mut gen = array::rand::<Int32Type>();
         assert_eq!(
-            *gen.generate(RowCount::from(3)).unwrap(),
+            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
             Int32Array::from_iter([-797553329, 1369325940, -69174021])
         );
 
-        let mut gen = array::rand_varbin(DEFAULT_SEED, ByteCount::from(3));
+        let mut gen = array::rand_varbin(ByteCount::from(3));
         assert_eq!(
-            *gen.generate(RowCount::from(3)).unwrap(),
-            arrow_array::BinaryArray::from_iter_values([[159, 104, 118], [68, 79, 77], [118, 208, 116]]));
+            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
+            arrow_array::BinaryArray::from_iter_values([[184, 53, 216], [12, 96, 159], [125, 179, 56]]));
 
-        let mut gen = array::rand_utf8(DEFAULT_SEED, ByteCount::from(3));
+        let mut gen = array::rand_utf8(ByteCount::from(3));
         assert_eq!(
-            *gen.generate(RowCount::from(3)).unwrap(),
-            arrow_array::StringArray::from_iter_values(["`)7", "dom", "725"]));
+            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
+            arrow_array::StringArray::from_iter_values([">@p", "n `", "NWa"]));
+    }
+
+    #[test]
+    fn test_nulls() {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+        let mut gen = array::rand::<Int32Type>().with_nulls(0.3);
+
+        let arr = gen.generate(RowCount::from(1000), &mut rng).unwrap();
+
+        // This assert depends on the default seed
+        assert_eq!(arr.null_count(), 297);
+
+        for len in 0..100 {
+            let arr = gen.generate(RowCount::from(len), &mut rng).unwrap();
+            // Make sure the null count we came up with matches the actual # of unset bits
+            assert_eq!(arr.null_count(), arr.nulls().map(|nulls| (len as usize) - nulls.buffer().count_set_bits_offset(0, len as usize)).unwrap_or(0));
+        }
+
+        let mut gen = array::rand::<Int32Type>().with_nulls(0.0);
+        let arr = gen.generate(RowCount::from(10), &mut rng).unwrap();
+
+        assert_eq!(arr.null_count(), 0);
+
+        let mut gen = array::rand::<Int32Type>().with_nulls(1.0);
+        let arr = gen.generate(RowCount::from(10), &mut rng).unwrap();
+
+        assert_eq!(arr.null_count(), 10);
+        assert!((0..10).all(|idx| arr.is_null(idx)));
     }
 
     #[test]

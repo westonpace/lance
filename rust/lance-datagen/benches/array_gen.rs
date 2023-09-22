@@ -5,7 +5,8 @@ use criterion::{
 };
 
 use lance_datagen::{
-    generator::ArrayGenerator, BatchCount, ByteCount, Dimension, RoundingBehavior,
+    generator::ArrayGenerator, ArrayGeneratorExt, BatchCount, ByteCount, Dimension,
+    RoundingBehavior,
 };
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -55,6 +56,24 @@ fn bench_step_gen<M: Measurement>(c: &mut Criterion<M>) {
     group.finish();
 }
 
+fn bench_null_gen(c: &mut Criterion) {
+    let mut group = c.benchmark_group("null");
+    group.throughput(Throughput::Bytes(BYTES_PER_BENCH));
+    bench_gen(&mut group, "0.0", || {
+        lance_datagen::array::fill::<Int32Type>(42).with_nulls(0.0)
+    });
+    bench_gen(&mut group, "0.25", || {
+        lance_datagen::array::fill::<Int16Type>(42).with_nulls(0.25)
+    });
+    bench_gen(&mut group, "0.75", || {
+        lance_datagen::array::fill::<Int32Type>(42).with_nulls(0.75)
+    });
+    bench_gen(&mut group, "1.0", || {
+        lance_datagen::array::fill::<Int64Type>(42).with_nulls(1.0)
+    });
+    group.finish();
+}
+
 fn bench_fill_gen(c: &mut Criterion) {
     let mut group = c.benchmark_group("fill");
     group.throughput(Throughput::Bytes(BYTES_PER_BENCH));
@@ -84,33 +103,29 @@ fn bench_fill_gen(c: &mut Criterion) {
 fn bench_rand_gen(c: &mut Criterion) {
     let mut group = c.benchmark_group("rand");
     group.throughput(Throughput::Bytes(BYTES_PER_BENCH));
-    let seed = lance_datagen::DEFAULT_SEED;
     bench_gen(&mut group, "rand_i8", || {
-        lance_datagen::array::rand::<Int8Type>(seed)
+        lance_datagen::array::rand::<Int8Type>()
     });
     bench_gen(&mut group, "rand_i16", || {
-        lance_datagen::array::rand::<Int16Type>(seed)
+        lance_datagen::array::rand::<Int16Type>()
     });
     bench_gen(&mut group, "rand_i32", || {
-        lance_datagen::array::rand::<Int32Type>(seed)
+        lance_datagen::array::rand::<Int32Type>()
     });
     bench_gen(&mut group, "rand_i64", || {
-        lance_datagen::array::rand::<Int64Type>(seed)
+        lance_datagen::array::rand::<Int64Type>()
     });
     bench_gen(&mut group, "rand_varbin", || {
-        lance_datagen::array::rand_varbin(seed, ByteCount::from(12))
+        lance_datagen::array::rand_varbin(ByteCount::from(12))
     });
     bench_gen(&mut group, "rand_utf8", || {
-        lance_datagen::array::rand_utf8(seed, ByteCount::from(12))
+        lance_datagen::array::rand_utf8(ByteCount::from(12))
     });
     bench_gen(&mut group, "rand_vec", || {
-        lance_datagen::array::rand_vec::<Float32Type>(seed, Dimension::from(512))
+        lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(512))
     });
     bench_gen(&mut group, "rand_dict_i32_utf8", || {
-        lance_datagen::array::dict::<Int32Type>(lance_datagen::array::rand_utf8(
-            seed,
-            ByteCount::from(8),
-        ))
+        lance_datagen::array::dict::<Int32Type>(lance_datagen::array::rand_utf8(ByteCount::from(8)))
     });
     group.finish();
 }
@@ -120,12 +135,12 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_step_gen, bench_fill_gen, bench_rand_gen);
+    targets = bench_step_gen, bench_fill_gen, bench_null_gen, bench_rand_gen);
 
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_step_gen, bench_fill_gen, bench_rand_gen);
+    targets = bench_step_gen, bench_fill_gen, bench_null_gen, bench_rand_gen);
 
 criterion_main!(benches);

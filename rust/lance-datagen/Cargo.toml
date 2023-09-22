@@ -10,8 +10,6 @@ keywords = { workspace = true }
 categories = { workspace = true }
 
 [dependencies]
-lance-arrow = { workspace = true }
-
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-cast = { workspace = true }
