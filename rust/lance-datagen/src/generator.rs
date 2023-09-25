@@ -694,6 +694,7 @@ pub mod array {
             DataType::Utf8 => rand_utf8(ByteCount::from(12)),
             DataType::Binary => rand_varbin(ByteCount::from(12)),
             DataType::Dictionary(key_type, value_type) => dict_type(rand_type(value_type), key_type),
+            DataType::FixedSizeList(child, dimension) => cycle_vec(rand_type(child.data_type()), Dimension::from(*dimension as u32)),
             _ => unimplemented!(),
         }
     }
