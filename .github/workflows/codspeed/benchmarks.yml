@@ -1,0 +1,39 @@
+name: codspeed-benchmarks
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+  # `workflow_dispatch` allows CodSpeed to trigger backtest
+  # performance analysis in order to generate initial data.
+  workflow_dispatch:
+
+jobs:
+  benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v3
+        with:
+          python-version: "3.10"
+      - name: Build manylinux image
+        if: ${{ inputs.arm-build == 'false' }}
+        shell: bash
+        working-directory: python
+        run: |
+          docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014  tools/
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release
+          working-directory: python
+          container: pylance_manylinux
+          docker-options: "-e SOME_FLAG_TO_INVALIDATE_CACHE=1"
+      - name: Install wheel
+        run: pip install python/targets/wheels/*.whl
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v1
+        with:
+          run: pytest tests/ --codspeed
