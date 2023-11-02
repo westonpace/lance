@@ -23,7 +23,6 @@ use pyo3::pymethods;
 use pyo3::PyResult;
 use tracing::subscriber;
 use tracing_chrome::{ChromeLayerBuilder, TraceStyle};
-use tracing_subscriber::filter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::Registry;
 
@@ -39,14 +38,14 @@ impl TraceGuard {
     }
 }
 
-fn get_filter(level: Option<&str>) -> PyResult<filter::LevelFilter> {
+fn get_level(level: Option<&str>) -> PyResult<tracing::Level> {
     match level {
-        Some("trace") => Ok(filter::LevelFilter::TRACE),
-        Some("debug") => Ok(filter::LevelFilter::DEBUG),
-        Some("info") => Ok(filter::LevelFilter::INFO),
-        Some("warn") => Ok(filter::LevelFilter::WARN),
-        Some("error") => Ok(filter::LevelFilter::ERROR),
-        None => Ok(filter::LevelFilter::INFO),
+        Some("trace") => Ok(tracing::Level::TRACE),
+        Some("debug") => Ok(tracing::Level::DEBUG),
+        Some("info") => Ok(tracing::Level::INFO),
+        Some("warn") => Ok(tracing::Level::WARN),
+        Some("error") => Ok(tracing::Level::ERROR),
+        None => Ok(tracing::Level::INFO),
         _ => Err(PyValueError::new_err(format!(
             "Unexpected tracing level: {}",
             level.unwrap()
@@ -61,7 +60,14 @@ pub fn trace_to_chrome(path: Option<&str>, level: Option<&str>) -> PyResult<Trac
         builder = builder.file(path);
     }
     let (chrome_layer, guard) = builder.build();
-    let subscriber = Registry::default().with(chrome_layer.with_filter(get_filter(level)?));
+    let level = get_level(level)?;
+    let targets_filter = tracing_subscriber::filter::Targets::new().with_target("lance", level);
+    let targets_filter = if level == tracing::Level::ERROR {
+        targets_filter.with_default(tracing::Level::ERROR)
+    } else {
+        targets_filter.with_default(tracing::Level::WARN)
+    };
+    let subscriber = Registry::default().with(chrome_layer.with_filter(targets_filter));
     subscriber::set_global_default(subscriber)
         .map(move |_| TraceGuard { guard: Some(guard) })
         .map_err(|_| {
