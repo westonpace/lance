@@ -1218,6 +1218,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_weston() {
+        let obj_store = ObjectStore::new_from_url(
+            Url::parse("s3://weston-s3-lance-test").unwrap(),
+            ObjectStoreParams::default(),
+        )
+        .await
+        .unwrap();
+        dbg!(obj_store.read_dir("/").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn test_local_paths() {
         let temp_dir = tempfile::tempdir().unwrap();
 
