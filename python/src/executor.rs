@@ -65,14 +65,18 @@ impl BackgroundExecutor {
         let (tx, rx) = std::sync::mpsc::channel::<T::Output>();
 
         let fut = Box::pin(async move {
+            println!("PY: TASK START");
             let task_output = task.await;
+            println!("PY: TASK END");
             tokio::task::spawn_blocking(move || {
+                println!("PY: TASK SEND");
                 tx.send(task_output).ok();
             })
             .await
             .unwrap();
         });
 
+        println!("PY: ENTER SPAWN");
         let handle = self.runtime.spawn(fut);
 
         loop {
@@ -86,9 +90,13 @@ impl BackgroundExecutor {
             }
             // Wait for 100ms before checking signals again
             match rx.recv_timeout(SIGNAL_CHECK_INTERVAL) {
-                Ok(output) => return Ok(output),
+                Ok(output) => {
+                    println!("PY: RECEIVED");
+                    return Ok(output);
+                }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
+                    println!("PY: DISCONNECTED");
                     handle.abort();
                     return Err(PyRuntimeError::new_err("Task was aborted"));
                 }
