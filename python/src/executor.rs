@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::mpsc::RecvTimeoutError;
+use std::{sync::mpsc::RecvTimeoutError, thread};
 
 use futures::Future;
 use pyo3::{exceptions::PyRuntimeError, PyResult, Python};
@@ -65,11 +65,11 @@ impl BackgroundExecutor {
         let (tx, rx) = std::sync::mpsc::channel::<T::Output>();
 
         let fut = Box::pin(async move {
-            println!("PY: TASK START");
+            println!("PY({:?}): TASK START", thread::current().id());
             let task_output = task.await;
-            println!("PY: TASK END");
+            println!("PY({:?}): TASK END", thread::current().id());
             tokio::task::spawn_blocking(move || {
-                println!("PY: TASK SEND");
+                println!("PY({:?}): TASK SEND", thread::current().id());
                 tx.send(task_output).ok();
             })
             .await
