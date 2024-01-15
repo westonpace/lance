@@ -48,8 +48,6 @@ impl CloudObjectReader {
     }
 }
 
-static IO_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 #[async_trait]
 impl Reader for CloudObjectReader {
     fn path(&self) -> &Path {
@@ -71,34 +69,14 @@ impl Reader for CloudObjectReader {
         // of the response body. Thus we add an outer retry loop here.
         let mut retries = 3;
         loop {
-            let incremented = IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-            println!(
-                "ADD: There are currently {} I/O operations in flight",
-                incremented + 1
-            );
             match self.object_store.get_range(&self.path, range.clone()).await {
                 Ok(bytes) => {
-                    let decremented = IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
-                    println!(
-                        "OK: There are currently {} I/O operations in flight",
-                        decremented - 1
-                    );
                     return Ok(bytes);
                 }
                 Err(err) => {
                     if retries == 0 {
-                        let decremented = IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
-                        println!(
-                            "ERR: There are currently {} I/O operations in flight",
-                            decremented - 1
-                        );
                         return Err(err.into());
                     }
-                    let decremented = IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
-                    println!(
-                        "RETRY: There are currently {} I/O operations in flight",
-                        decremented - 1
-                    );
                     retries -= 1;
                 }
             }
