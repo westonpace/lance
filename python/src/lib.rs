@@ -18,9 +18,8 @@
 //! automatic versioning, optimized for computer vision, bioinformatics, spatial and ML data.
 //! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
 
-use std::cell::RefCell;
 use std::env;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ::arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use ::arrow::pyarrow::PyArrowType;
@@ -87,20 +86,12 @@ lazy_static! {
     static ref RT: BackgroundExecutor = BackgroundExecutor::new();
 }
 
-static CONSOLE_SUBSCRIBED: Mutex<bool> = Mutex::new(false);
-
 #[pymodule]
 fn lance(py: Python, m: &PyModule) -> PyResult<()> {
-    // let env = Env::new()
-    //     .filter_or("LANCE_LOG", "warn")
-    //     .write_style("LANCE_LOG_STYLE");
-    // env_logger::init_from_env(env);
-
-    let mut flag = CONSOLE_SUBSCRIBED.lock().unwrap();
-    if !*flag {
-        console_subscriber::init();
-        *flag = true;
-    }
+    let env = Env::new()
+        .filter_or("LANCE_LOG", "warn")
+        .write_style("LANCE_LOG_STYLE");
+    env_logger::init_from_env(env);
 
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
