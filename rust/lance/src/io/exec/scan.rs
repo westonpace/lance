@@ -134,14 +134,15 @@ impl LanceStream {
         let inner_stream = if scan_in_order {
             stream::iter(file_fragments)
                 .map(move |file_fragment| {
-                    Ok(open_file(
+                    tokio::spawn(open_file(
                         file_fragment,
                         project_schema.clone(),
                         with_row_id,
                         with_make_deletions_null,
                     ))
+                    .map(|val| val.unwrap())
                 })
-                .try_buffered(fragment_readahead)
+                .buffered(fragment_readahead)
                 .map_ok(move |reader| scan_batches(reader, read_size))
                 // We must be waiting to finish a file before moving onto thenext. That's an issue.
                 .try_flatten()
