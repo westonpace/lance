@@ -35,6 +35,9 @@ pub struct Metadata {
 
     /// Metadata about statistics.
     pub stats_metadata: Option<StatisticsMetadata>,
+
+    /// The starting point for the column metadata in a Lance v2 file
+    pub column_metadata_start: u64,
 }
 
 impl ProtoStruct for Metadata {
@@ -60,6 +63,7 @@ impl From<&Metadata> for pb::Metadata {
             manifest_position: m.manifest_position.unwrap_or(0) as u64,
             statistics,
             num_columns: 0,
+            column_metadata_start: m.column_metadata_start,
         }
     }
 }
@@ -82,6 +86,7 @@ impl From<pb::Metadata> for Metadata {
             } else {
                 None
             },
+            column_metadata_start: m.column_metadata_start,
         }
     }
 }

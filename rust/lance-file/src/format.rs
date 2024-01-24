@@ -12,6 +12,7 @@ pub mod pb {
 }
 
 pub mod metadata;
+pub mod schema;
 
 /// These version/magic values are written at the end of Lance files (e.g. versions/1.version)
 pub const MAJOR_VERSION: i16 = 0;

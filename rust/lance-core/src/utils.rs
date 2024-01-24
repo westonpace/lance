@@ -17,4 +17,5 @@ pub mod cpu;
 pub mod deletion;
 pub mod mask;
 pub mod testing;
+pub mod tokio;
 pub mod tracing;

@@ -25,6 +25,7 @@ use arrow_select::take::take;
 use async_trait::async_trait;
 // Re-export
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::ROW_ID_FIELD;
 pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizerImpl};
 use lance_index::{
@@ -40,8 +41,8 @@ use snafu::{location, Location};
 use tracing::instrument;
 
 use super::VectorIndex;
+use crate::arrow::*;
 use crate::index::prefilter::PreFilter;
-use crate::{arrow::*, utils::tokio::spawn_cpu};
 use crate::{Error, Result};
 
 /// Product Quantization Index.

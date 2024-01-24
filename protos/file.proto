@@ -109,7 +109,7 @@ message ValueEncoding {
 //  * Validity - A boolean array representing whether each value is null or not
 message MaskedEncoding {
   // The encoding used to store the values
-  Encoding value_encoding = 1;
+  EncodingType value_encoding = 1;
   // The encoding used to store the validity
   EncodingType validity_encoding = 2;
 }
@@ -140,8 +140,12 @@ message DictionaryEncoding {
 message VariableLengthEncoding {
   // The number of bits in each offset
   uint32 offset_width = 1;
-  // If true, then lists with length 0 should be considered null values
-  bool empty_is_null = 2;
+  // The encoding used to encode the validity buffer of the list itself
+  //
+  // This message is optional.  If it is not present then values with zero
+  // length should be considered nulls.  This allows us to avoid encoding a validity
+  // buffer when there are no empty values in the source data.
+  EncodingType null_encoding = 2;
   // The encoding used to encode the offsets
   EncodingType offset_encoding = 3;
   // The encoding used to encode the values
@@ -180,16 +184,13 @@ message ColumnMetadata {
     // This field will have the same length as `buffer_offsets` and
     // may be empty.
     repeated uint64 buffer_sizes = 2;
-    // The file offset to the start of the page data
-    uint64 offset = 3;
-    // The size (in bytes) of the page data
-    uint64 size = 4;
     // Logical length (e.g. # rows) of the page
     uint32 length = 5;
     // The top-level node of the encoding tree used to encode the page
     EncodingType encoding = 6;
   }
   repeated Page pages = 1;
+  ColumnStatistics statistics = 2;
   
   // Statistics store the min/max/nulls/... statistics of a page.
   // There is an array for each statistic.  The logical length of the
@@ -312,8 +313,16 @@ message Metadata {
   // The size of the metadata for column x is given by the uint64:
   //   file[column_offsets_pos + (16 * x) + 8]
   //
-  // This field is ignored in a Lance version 1 file (the page table is used instead)
+  // This field is ignored in a Lance version 1 files (the page table is used instead)
   uint32 num_columns = 6;
+  // The start of the column metadata section
+  //
+  // If column projection is not needed, or if the goal is to cache all column
+  // metadata, then this field can be used to quickly load the entire column metadata
+  // section in a single read.
+  //
+  // This field is ignored in Lance version 1 files
+  uint64 column_metadata_start = 7;
 } // Metadata
 
 // Supported encodings.

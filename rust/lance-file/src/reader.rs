@@ -922,6 +922,1050 @@ where
     Ok(Arc::new(arr) as ArrayRef)
 }
 
+pub mod v2 {
+    use std::ops::Range;
+    use std::{collections::HashMap, sync::Arc};
+
+    use arrow_array::types::{ArrowPrimitiveType, Float32Type, Int32Type, Int64Type, UInt32Type};
+    use arrow_array::{new_null_array, ArrayRef, PrimitiveArray, RecordBatch};
+    use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, ScalarBuffer};
+    use arrow_schema::DataType;
+    use byteorder::{ByteOrder, LittleEndian};
+    use bytes::{buf::BufMut, Bytes, BytesMut};
+    use futures::channel::oneshot;
+    use futures::{Stream, StreamExt, TryFutureExt};
+    use lance_core::datatypes::{Field, Schema};
+    use lance_core::{Error, Result};
+    use lance_io::traits::Reader;
+    use lance_io::ReadBatchParams;
+    use prost::Message;
+    use snafu::{location, Location};
+    use tokio::sync::mpsc;
+
+    use crate::format::schema::FileDescriptor;
+    use crate::format::{pb, MAGIC};
+
+    struct ScheduledPage {
+        pending: Option<oneshot::Receiver<Vec<Vec<Bytes>>>>,
+        data: Vec<Vec<Bytes>>,
+        decoder: Box<dyn PageDecoder>,
+        target_col_idx: u32,
+        num_rows: u32,
+    }
+
+    impl ScheduledPage {
+        async fn wait(&mut self) {
+            if self.pending.is_some() {
+                let mut data = self.pending.take().unwrap().await.unwrap();
+                std::mem::swap(&mut data, &mut self.data);
+            }
+        }
+    }
+
+    trait PageDecoder: Send + Sync {
+        fn update_capacity(
+            &self,
+            data: &[Vec<Bytes>],
+            rows_to_skip: u32,
+            num_rows: u32,
+            buffers: &mut [(u64, bool)],
+        );
+        fn drain(
+            &self,
+            // TODO: Coalesce on read and change this to &[Bytes]
+            data: &[Vec<Bytes>],
+            rows_to_skip: u32,
+            num_rows: u32,
+            dest_offset: u32,
+            dest_buffers: &mut [BytesMut],
+        );
+    }
+
+    struct IoRequest {
+        ranges: Vec<Vec<std::ops::Range<u64>>>,
+    }
+
+    pub struct Scheduled {
+        io_request: Option<IoRequest>,
+        decoder: Box<dyn PageDecoder>,
+    }
+
+    // TODO: Does the name ArrayDecoder work here?  Isn't this still a per-page thing?
+    pub trait ArrayDecoder: Send + Sync {
+        fn num_buffers(&self) -> u32;
+        fn schedule_range(&self, range: Range<u32>) -> Scheduled;
+        fn schedule_take(&self, indices: PrimitiveArray<UInt32Type>) -> Scheduled;
+
+        fn schedule_decode(&self, params: ReadBatchParams, num_rows: u32) -> Scheduled {
+            match params {
+                ReadBatchParams::Indices(indices) => self.schedule_take(indices),
+                ReadBatchParams::Range(range) => {
+                    self.schedule_range(range.start as u32..range.end as u32)
+                }
+                ReadBatchParams::RangeFrom(range) => {
+                    self.schedule_range(range.start as u32..num_rows)
+                }
+                ReadBatchParams::RangeTo(range) => self.schedule_range(0..range.end as u32),
+                ReadBatchParams::RangeFull => self.schedule_range(0..num_rows),
+            }
+        }
+    }
+
+    struct NullDecoder {}
+
+    struct NullPageDecoder {}
+
+    impl PageDecoder for NullPageDecoder {
+        fn update_capacity(
+            &self,
+            _data: &[Vec<Bytes>],
+            _rows_to_skip: u32,
+            _num_rows: u32,
+            _buffers: &mut [(u64, bool)],
+        ) {
+            // No buffers for null arrays
+            // If this is the validity array then it is not needed so leave the bool as false
+        }
+
+        fn drain(
+            &self,
+            _data: &[Vec<Bytes>],
+            _rows_to_skip: u32,
+            _num_rows: u32,
+            _dest_offset: u32,
+            _dest_buffers: &mut [BytesMut],
+        ) {
+            // No buffers for null arrays
+        }
+    }
+
+    impl ArrayDecoder for NullDecoder {
+        fn num_buffers(&self) -> u32 {
+            0
+        }
+
+        fn schedule_take(&self, _indices: PrimitiveArray<UInt32Type>) -> Scheduled {
+            Scheduled {
+                io_request: None,
+                decoder: Box::new(NullPageDecoder {}),
+            }
+        }
+
+        fn schedule_range(&self, _range: Range<u32>) -> Scheduled {
+            Scheduled {
+                io_request: None,
+                decoder: Box::new(NullPageDecoder {}),
+            }
+        }
+    }
+
+    struct ValueDecoder {
+        bytes_per_value: u32,
+    }
+
+    struct ValuePageDecoder {
+        bytes_per_value: u32,
+    }
+
+    impl PageDecoder for ValuePageDecoder {
+        fn update_capacity(
+            &self,
+            _data: &[Vec<Bytes>],
+            _rows_to_skip: u32,
+            num_rows: u32,
+            buffers: &mut [(u64, bool)],
+        ) {
+            buffers[0].0 = self.bytes_per_value as u64 * num_rows as u64;
+            // Validity can never be encoded as a values (bitmap is a special decoder)
+            // and so we don't have to worry about buffers[0].1
+        }
+
+        fn drain(
+            &self,
+            data: &[Vec<Bytes>],
+            rows_to_skip: u32,
+            // TODO: Review and remove these unused args
+            _num_rows: u32,
+            _dest_offset: u32,
+            dest_buffers: &mut [BytesMut],
+        ) {
+            let mut bytes_to_skip = rows_to_skip as u64 * self.bytes_per_value as u64;
+            let data_buf = &data[0];
+            let dest = &mut dest_buffers[0];
+
+            for buf in data_buf {
+                let buf_len = buf.len() as u64;
+                if bytes_to_skip > buf_len {
+                    println!("Skipping entire page of {} bytes", buf_len);
+                    bytes_to_skip -= buf_len;
+                } else {
+                    bytes_to_skip = 0;
+                    println!("Copying bytes {}..{} of page", bytes_to_skip, buf.len());
+                    println!("{:?}", buf.slice(bytes_to_skip as usize..));
+                    dest.put_slice(&buf.slice(bytes_to_skip as usize..));
+                }
+            }
+        }
+    }
+
+    impl ArrayDecoder for ValueDecoder {
+        fn num_buffers(&self) -> u32 {
+            1
+        }
+
+        fn schedule_range(&self, range: Range<u32>) -> Scheduled {
+            let start = range.start as u64 * self.bytes_per_value as u64;
+            let end = range.end as u64 * self.bytes_per_value as u64;
+            let byte_range = start..end;
+
+            Scheduled {
+                io_request: Some(IoRequest {
+                    ranges: vec![vec![byte_range]],
+                }),
+                decoder: Box::new(ValuePageDecoder {
+                    bytes_per_value: self.bytes_per_value,
+                }),
+            }
+        }
+
+        fn schedule_take(&self, indices: PrimitiveArray<UInt32Type>) -> Scheduled {
+            let iops = indices
+                .values()
+                .iter()
+                .map(|idx| {
+                    let start = *idx as u64 * self.bytes_per_value as u64;
+                    let end = start + self.bytes_per_value as u64;
+                    start..end
+                })
+                .collect::<Vec<_>>();
+
+            Scheduled {
+                io_request: Some(IoRequest { ranges: vec![iops] }),
+                decoder: Box::new(ValuePageDecoder {
+                    bytes_per_value: self.bytes_per_value,
+                }),
+            }
+        }
+    }
+
+    struct BitmapDecoder {}
+
+    struct BitmapPageDecoder {}
+
+    impl PageDecoder for BitmapPageDecoder {
+        fn update_capacity(
+            &self,
+            _data: &[Vec<Bytes>],
+            _rows_to_skip: u32,
+            num_rows: u32,
+            buffers: &mut [(u64, bool)],
+        ) {
+            buffers[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
+            // This could be a validity buffer, if so, then it is needed since the writer
+            // went through the hassle of encoding it
+            buffers[0].1 = true;
+        }
+
+        fn drain(
+            &self,
+            data: &[Vec<Bytes>],
+            rows_to_skip: u32,
+            // TODO: Review and remove these unused args
+            num_rows: u32,
+            _dest_offset: u32,
+            dest_buffers: &mut [BytesMut],
+        ) {
+            let mut bytes_to_fully_skip = rows_to_skip as u64 / 8;
+            let mut bits_to_skip = rows_to_skip % 8;
+            let data_buf = &data[0];
+
+            let mut dest_builder = BooleanBufferBuilder::new(num_rows as usize);
+
+            for buf in data_buf {
+                let buf_len = buf.len() as u64;
+                if bytes_to_fully_skip > buf_len {
+                    println!("Skipping entire page of {} bytes", buf_len);
+                    bytes_to_fully_skip -= buf_len;
+                } else {
+                    println!(
+                        "Copying bytes {}..{} of page (skipping {} bits in first byte)",
+                        bytes_to_fully_skip,
+                        buf.len(),
+                        bits_to_skip
+                    );
+                    let num_vals = buf_len * 8;
+                    // I love that this method exists
+                    dest_builder
+                        .append_packed_range(bits_to_skip as usize..num_vals as usize, &buf);
+                    bytes_to_fully_skip = 0;
+                    bits_to_skip = 0;
+                }
+            }
+
+            let bool_buffer = dest_builder.finish().into_inner();
+            unsafe { dest_buffers[0].set_len(bool_buffer.len()) }
+            // TODO: This requires an extra copy.  First we copy the data from the read buffer(s)
+            // into dest_builder (one copy is inevitable).  Then we copy the data from dest_builder
+            // into dest_buffers.  This second copy could be avoided (e.g. BooleanBufferBuilder
+            // has a new_from_buffer but that requires MutableBuffer and we can't easily get there
+            // from BytesMut [or can we?])
+            //
+            // Worst case, we vendor our own copy of BooleanBufferBuilder based on BytesMut.  We could
+            // also use MutableBuffer ourselves instead of BytesMut but arrow-rs claims MutableBuffer may
+            // be deprecated in the future (though that discussion seems to have died)
+            dest_buffers[0].copy_from_slice(bool_buffer.as_slice());
+        }
+    }
+
+    impl ArrayDecoder for BitmapDecoder {
+        fn num_buffers(&self) -> u32 {
+            1
+        }
+
+        fn schedule_range(&self, range: Range<u32>) -> Scheduled {
+            debug_assert_ne!(range.start, range.end);
+            let start = range.start as u64 / 8;
+            let end = (range.end as u64 / 8) + 1;
+            let byte_range = start..end;
+
+            Scheduled {
+                io_request: Some(IoRequest {
+                    ranges: vec![vec![byte_range]],
+                }),
+                decoder: Box::new(BitmapPageDecoder {}),
+            }
+        }
+
+        fn schedule_take(&self, indices: PrimitiveArray<UInt32Type>) -> Scheduled {
+            let iops = indices
+                .values()
+                .iter()
+                .map(|idx| {
+                    let byte_idx = (*idx as u64) / 8;
+                    byte_idx..byte_idx + 1
+                })
+                .collect::<Vec<_>>();
+
+            // TODO: dedup?  Or maybe let I/O scheduler deal with it so we don't have to
+            // un-dedup on decode?
+
+            Scheduled {
+                io_request: Some(IoRequest { ranges: vec![iops] }),
+                decoder: Box::new(BitmapPageDecoder {}),
+            }
+        }
+    }
+
+    struct BasicDecoder {
+        validity_decoder: Box<dyn ArrayDecoder>,
+        value_decoder: Box<dyn ArrayDecoder>,
+    }
+
+    struct BasicPageDecoder {
+        validity_decoder: Box<dyn PageDecoder>,
+        value_decoder: Box<dyn PageDecoder>,
+        num_validity_buffers: u32,
+    }
+
+    impl PageDecoder for BasicPageDecoder {
+        fn update_capacity(
+            &self,
+            data: &[Vec<Bytes>],
+            rows_to_skip: u32,
+            num_rows: u32,
+            buffers: &mut [(u64, bool)],
+        ) {
+            self.validity_decoder.update_capacity(
+                &data[..self.num_validity_buffers as usize],
+                rows_to_skip,
+                num_rows,
+                &mut buffers[..1],
+            );
+            self.value_decoder.update_capacity(
+                &data[self.num_validity_buffers as usize..],
+                rows_to_skip,
+                num_rows,
+                &mut buffers[1..],
+            );
+        }
+
+        fn drain(
+            &self,
+            data: &[Vec<Bytes>],
+            rows_to_skip: u32,
+            num_rows: u32,
+            dest_offset: u32,
+            dest_buffers: &mut [BytesMut],
+        ) {
+            self.validity_decoder.drain(
+                &data[..self.num_validity_buffers as usize],
+                rows_to_skip,
+                num_rows,
+                dest_offset,
+                &mut dest_buffers[..1],
+            );
+            self.value_decoder.drain(
+                &data[self.num_validity_buffers as usize..],
+                rows_to_skip,
+                num_rows,
+                dest_offset,
+                &mut dest_buffers[1..],
+            );
+        }
+    }
+
+    impl BasicDecoder {
+        fn combine(&self, validity: Scheduled, values: Scheduled) -> Scheduled {
+            let io_request = match (validity.io_request, values.io_request) {
+                (None, None) => None,
+                (Some(io_request), None) => Some(io_request),
+                (None, Some(io_request)) => Some(io_request),
+                (Some(lhs), Some(rhs)) => {
+                    let mut all_ranges = lhs.ranges;
+                    all_ranges.extend(rhs.ranges);
+                    Some(IoRequest { ranges: all_ranges })
+                }
+            };
+            let decoder = Box::new(BasicPageDecoder {
+                validity_decoder: validity.decoder,
+                value_decoder: values.decoder,
+                num_validity_buffers: self.validity_decoder.num_buffers(),
+            });
+            Scheduled {
+                decoder,
+                io_request,
+            }
+        }
+    }
+
+    impl ArrayDecoder for BasicDecoder {
+        fn num_buffers(&self) -> u32 {
+            self.validity_decoder.num_buffers() + self.value_decoder.num_buffers()
+        }
+
+        fn schedule_take(&self, indices: PrimitiveArray<UInt32Type>) -> Scheduled {
+            let validity_scheduled = self.validity_decoder.schedule_take(indices.clone());
+            let value_scheduled = self.value_decoder.schedule_take(indices);
+            self.combine(validity_scheduled, value_scheduled)
+        }
+
+        fn schedule_range(&self, range: Range<u32>) -> Scheduled {
+            let validity_scheduled = self.validity_decoder.schedule_range(range.clone());
+            let value_scheduled = self.value_decoder.schedule_range(range);
+            self.combine(validity_scheduled, value_scheduled)
+        }
+    }
+
+    struct PageInfo {
+        array_decoder: Box<dyn ArrayDecoder>,
+        num_rows: u32,
+        buffer_offsets: Vec<u64>,
+    }
+
+    struct ColumnInfo {
+        page_infos: Vec<PageInfo>,
+    }
+
+    struct FileDecoder {
+        column_infos: Vec<ColumnInfo>,
+    }
+
+    struct PartiallyDecodedPage {
+        page: Arc<ScheduledPage>,
+        rows_remaining: u32,
+        rows_taken: u32,
+    }
+
+    struct DecodeStep {
+        page: Arc<ScheduledPage>,
+        rows_to_take: u32,
+        rows_to_skip: u32,
+    }
+
+    struct DecodeTask {
+        columns: Vec<Vec<DecodeStep>>,
+        schema: Arc<Schema>,
+    }
+
+    impl DecodeTask {
+        fn initialize_buff_lengths(_field: &Field) -> Vec<(u64, bool)> {
+            // TODO: Handle different field types
+            vec![(0, false), (0, true)]
+        }
+
+        fn new_primitive_array<T: ArrowPrimitiveType>(
+            buffers: Vec<BytesMut>,
+            num_rows: u32,
+        ) -> ArrayRef {
+            println!("Creating arrow array from buffers: {:?}", buffers);
+            let mut buffer_iter = buffers.into_iter();
+            let null_buffer = buffer_iter.next().unwrap();
+            let null_buffer = if null_buffer.is_empty() {
+                println!("Skipping null buffer");
+                None
+            } else {
+                let null_buffer = null_buffer.freeze().into();
+                println!("Using null buffer: {:?}", null_buffer);
+                Some(NullBuffer::new(BooleanBuffer::new(
+                    Buffer::from_bytes(null_buffer),
+                    0,
+                    num_rows as usize,
+                )))
+            };
+
+            let data_buffer = buffer_iter.next().unwrap().freeze();
+            println!("Using data buffer: {:?}", data_buffer);
+            let data_buffer = Buffer::from(data_buffer);
+            let data_buffer = ScalarBuffer::<T::Native>::new(data_buffer, 0, num_rows as usize);
+
+            Arc::new(PrimitiveArray::<T>::new(data_buffer, null_buffer))
+        }
+
+        fn finalize_array(field: &Field, buffers: Vec<BytesMut>, num_rows: u32) -> ArrayRef {
+            let data_type = field.data_type();
+            match &data_type {
+                DataType::Null => new_null_array(&data_type, num_rows as usize),
+                DataType::Int32 => Self::new_primitive_array::<Int32Type>(buffers, num_rows),
+                DataType::Int64 => Self::new_primitive_array::<Int64Type>(buffers, num_rows),
+                DataType::Float32 => Self::new_primitive_array::<Float32Type>(buffers, num_rows),
+                _ => panic!("Still need to write handler for {}", field.data_type()),
+            }
+        }
+
+        fn run(self) -> Result<RecordBatch> {
+            // TODO: to .map instead of for-each
+            let mut arrays = Vec::new();
+            for (col_idx, column_steps) in self.columns.into_iter().enumerate() {
+                println!("Decoding column {}", col_idx);
+                let field = &self.schema.fields[col_idx];
+                let mut buf_lengths = Self::initialize_buff_lengths(field);
+                for step in &column_steps {
+                    step.page.decoder.update_capacity(
+                        &step.page.data,
+                        step.rows_to_skip,
+                        step.rows_to_take,
+                        &mut buf_lengths,
+                    );
+                }
+                println!("Estimated capacities: {:?}", buf_lengths);
+                let mut buffers = buf_lengths
+                    .into_iter()
+                    .map(|(num_bytes, needed)| {
+                        if !needed {
+                            BytesMut::new()
+                        } else {
+                            BytesMut::with_capacity(num_bytes as usize)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut row_offset = 0;
+                for step in &column_steps {
+                    step.page.decoder.drain(
+                        &step.page.data,
+                        step.rows_to_skip,
+                        step.rows_to_take,
+                        row_offset,
+                        &mut buffers,
+                    );
+                    row_offset += step.rows_to_take;
+                }
+                arrays.push(Self::finalize_array(field, buffers, row_offset));
+            }
+            Ok(RecordBatch::try_new(
+                Arc::new(arrow_schema::Schema::from(self.schema.as_ref())),
+                arrays,
+            )?)
+        }
+        fn submit(self) -> impl std::future::Future<Output = Result<RecordBatch>> {
+            tokio::task::spawn_blocking(move || self.run()).unwrap_or_else(|err| panic!("{}", err))
+        }
+    }
+
+    struct DecodeStream {
+        source: mpsc::Receiver<ScheduledPage>,
+        partial_pages: Vec<PartiallyDecodedPage>,
+        schema: Arc<Schema>,
+        rows_remaining: u32,
+        rows_per_batch: u32,
+    }
+
+    impl DecodeStream {
+        fn new(
+            rx: mpsc::Receiver<ScheduledPage>,
+            schema: Arc<Schema>,
+            num_rows: u32,
+            rows_per_batch: u32,
+        ) -> Self {
+            Self {
+                source: rx,
+                partial_pages: Vec::new(),
+                schema,
+                rows_remaining: num_rows,
+                rows_per_batch,
+            }
+        }
+
+        async fn next_batch_task(&mut self) -> Option<DecodeTask> {
+            if self.rows_remaining == 0 {
+                return None;
+            }
+            let mut pages = Vec::new();
+            std::mem::swap(&mut pages, &mut self.partial_pages);
+            let mut page_iter = pages.into_iter().peekable();
+            let mut batch_steps = Vec::new();
+            let rows_in_batch = self.rows_per_batch.min(self.rows_remaining);
+            self.rows_remaining -= rows_in_batch;
+            for col_idx in 0..self.schema.fields.len() {
+                let mut col_steps = Vec::new();
+                let mut rows_remaining = rows_in_batch;
+                while rows_remaining > 0 {
+                    let mut next_page_for_field = if page_iter
+                        .peek()
+                        .map(|partial_page| partial_page.page.target_col_idx)
+                        .unwrap_or(u32::MAX)
+                        == col_idx as u32
+                    {
+                        page_iter.next().unwrap()
+                    } else {
+                        let mut page = self.source.recv().await.unwrap();
+                        page.wait().await;
+                        PartiallyDecodedPage {
+                            rows_remaining: page.num_rows,
+                            rows_taken: 0,
+                            page: Arc::new(page),
+                        }
+                    };
+                    let rows_to_take = rows_remaining.min(next_page_for_field.rows_remaining);
+                    col_steps.push(DecodeStep {
+                        page: next_page_for_field.page.clone(),
+                        rows_to_take,
+                        rows_to_skip: next_page_for_field.rows_taken,
+                    });
+                    next_page_for_field.rows_remaining -= rows_to_take;
+                    next_page_for_field.rows_taken += rows_to_take;
+                    rows_remaining -= rows_to_take;
+                    if next_page_for_field.rows_remaining > 0 {
+                        self.partial_pages.push(next_page_for_field);
+                    }
+                }
+                batch_steps.push(col_steps);
+            }
+            Some(DecodeTask {
+                columns: batch_steps,
+                schema: self.schema.clone(),
+            })
+        }
+
+        pub fn into_stream(
+            self,
+        ) -> impl Stream<Item = impl std::future::Future<Output = Result<RecordBatch>>> {
+            futures::stream::unfold(self, |mut slf| async move {
+                let next_task = slf.next_batch_task().await;
+                next_task.map(|task| (task.submit(), slf))
+            })
+        }
+    }
+
+    impl FileDecoder {
+        fn try_new(cached_metadata: Arc<CachedFileMetadata>, projection: &Schema) -> Result<Self> {
+            let column_infos = projection
+                .fields
+                .iter()
+                .map(|f| {
+                    let column_metadata = cached_metadata
+                        .column_metadatas
+                        .get(&(f.id as u32))
+                        .unwrap();
+                    let page_infos = column_metadata
+                        .pages
+                        .iter()
+                        .map(|page| {
+                            Ok(PageInfo {
+                                array_decoder: Self::create_decoder(
+                                    f.data_type(),
+                                    page.encoding.clone().unwrap(),
+                                    page.length,
+                                )?,
+                                num_rows: page.length,
+                                buffer_offsets: page.buffer_offsets.clone(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(ColumnInfo { page_infos })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self { column_infos })
+        }
+
+        fn create_decoder(
+            data_type: DataType,
+            encoding: pb::EncodingType,
+            num_rows: u32,
+        ) -> Result<Box<dyn ArrayDecoder>> {
+            match encoding.r#type.unwrap() {
+                pb::encoding_type::Type::Constant(constant) => {
+                    if constant.value.is_empty() {
+                        Ok(Box::new(NullDecoder {}))
+                    } else {
+                        panic!("TOOD: constant decoder with non-null value")
+                    }
+                }
+                pb::encoding_type::Type::Value(value) => {
+                    let bits_per_value = value.item_width;
+                    if bits_per_value == 1 {
+                        Ok(Box::new(BitmapDecoder {}))
+                    } else if bits_per_value % 8 == 0 {
+                        let bytes_per_value = bits_per_value / 8;
+                        Ok(Box::new(ValueDecoder { bytes_per_value }))
+                    } else {
+                        panic!("Cannot handle a bits per value that is not a multiple of 8")
+                    }
+                }
+                pb::encoding_type::Type::Masked(masked) => {
+                    let validity_decoder = Self::create_decoder(
+                        DataType::Boolean,
+                        *masked.validity_encoding.unwrap(),
+                        num_rows,
+                    )?;
+                    let value_decoder =
+                        Self::create_decoder(data_type, *masked.value_encoding.unwrap(), num_rows)?;
+                    Ok(Box::new(BasicDecoder {
+                        validity_decoder,
+                        value_decoder,
+                    }))
+                }
+                pb::encoding_type::Type::Dictionary(_) => todo!(),
+                pb::encoding_type::Type::VariableLength(_) => todo!(),
+            }
+        }
+
+        // TODO: Schedule this and remove the unwraps
+        async fn do_io(
+            reader: Arc<dyn Reader>,
+            buffer_offsets: &Vec<u64>,
+            io_request: IoRequest,
+        ) -> Vec<Vec<Bytes>> {
+            let mut buffers = Vec::new();
+            for (buffer_idx, range_set) in io_request.ranges.into_iter().enumerate() {
+                let mut bytes = Vec::new();
+                // TODO: Coalesce these reads into one buffer
+                for range in range_set {
+                    println!("Requesting range: {:?}", range);
+                    let start = range.start as usize + buffer_offsets[buffer_idx] as usize;
+                    let end = start + (range.end - range.start) as usize;
+                    let buffer = reader.get_range(start..end).await.unwrap();
+                    dbg!(&buffer);
+                    bytes.push(buffer);
+                }
+                buffers.push(bytes);
+            }
+            buffers
+        }
+
+        // TODO: Should reader be in FileDecoder or should FileDecoder be part of FileReader?
+        fn schedule_io(
+            &self,
+            reader: Arc<dyn Reader>,
+            buffer_offsets: &Vec<u64>,
+            io: Scheduled,
+            num_rows: u32,
+            col_idx: u32,
+        ) -> ScheduledPage {
+            if let Some(io_request) = io.io_request {
+                let (tx, rx) = oneshot::channel();
+                let buffer_offsets = buffer_offsets.clone();
+                tokio::spawn(async move {
+                    let data = Self::do_io(reader, &buffer_offsets, io_request).await;
+                    tx.send(data).unwrap();
+                });
+                ScheduledPage {
+                    data: Vec::new(),
+                    decoder: io.decoder,
+                    num_rows,
+                    pending: Some(rx),
+                    target_col_idx: col_idx,
+                }
+            } else {
+                // TODO: make sure we test this case (e.g. Null-typed array?)
+                ScheduledPage {
+                    data: Vec::new(),
+                    decoder: io.decoder,
+                    num_rows,
+                    pending: None,
+                    target_col_idx: col_idx,
+                }
+            }
+        }
+
+        async fn schedule_loop(
+            &self,
+            reader: Arc<dyn Reader>,
+            range: Range<u32>,
+            sink: mpsc::Sender<ScheduledPage>,
+        ) {
+            let mut rows_to_skip = range.start;
+            let mut rows_to_read = range.end - range.start;
+            let mut row_offsets = vec![0_u32; self.column_infos.len()];
+            let mut page_offsets = vec![0_u32; self.column_infos.len()];
+            let mut rows_queued = vec![0_u32; self.column_infos.len()];
+
+            while rows_to_read > 0 {
+                let mut min_rows_added = u32::MAX;
+                for (col_idx, column) in self.column_infos.iter().enumerate() {
+                    if rows_queued[col_idx] == 0 {
+                        let mut page_info =
+                            &column.page_infos[page_offsets[col_idx as usize] as usize];
+                        page_offsets[col_idx] += 1;
+
+                        while rows_to_skip > page_info.num_rows {
+                            rows_to_skip -= page_info.num_rows;
+                            row_offsets[col_idx as usize] += page_info.num_rows;
+                            page_info = &column.page_infos[page_offsets[col_idx as usize] as usize];
+                            page_offsets[col_idx] += 1;
+                        }
+
+                        let rows_to_add = rows_to_read.min(page_info.num_rows - rows_to_skip);
+                        let range_start = row_offsets[col_idx as usize] + rows_to_skip;
+                        let range_end = range_start + rows_to_add;
+                        min_rows_added = min_rows_added.min(rows_to_add);
+                        rows_queued[col_idx] = rows_to_add;
+                        rows_to_skip = 0;
+
+                        sink.send(
+                            self.schedule_io(
+                                reader.clone(),
+                                &page_info.buffer_offsets,
+                                page_info
+                                    .array_decoder
+                                    .schedule_range(range_start..range_end),
+                                rows_to_add,
+                                col_idx as u32,
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+                if min_rows_added == 0 {
+                    panic!("Error in scheduling logic, panic to avoid infinite loop");
+                }
+                rows_to_read -= min_rows_added;
+                for col_idx in 0..self.column_infos.len() {
+                    rows_queued[col_idx] -= min_rows_added;
+                }
+            }
+        }
+    }
+
+    // TODO: Caching
+    pub struct CachedFileMetadata {
+        /// The schema of the file
+        pub file_schema: Schema,
+        /// The column metadatas
+        pub column_metadatas: HashMap<u32, pb::ColumnMetadata>,
+        /// The number of rows in the file
+        pub num_rows: u32,
+    }
+
+    pub struct FileReader {
+        object_reader: Arc<dyn Reader>,
+        // The projected schema, which should be a subset of
+        // the file schema, potentially reordered
+        projected_schema: Schema,
+        file_decoder: Arc<FileDecoder>,
+        num_rows: u32,
+    }
+
+    impl FileReader {
+        async fn read_tail(reader: &dyn Reader) -> Result<(Bytes, u64)> {
+            let file_size = reader.size().await? as u64;
+            let begin = if file_size < reader.block_size() as u64 {
+                0
+            } else {
+                file_size - reader.block_size() as u64
+            };
+            let tail_bytes = reader.get_range(begin as usize..file_size as usize).await?;
+            Ok((tail_bytes, file_size))
+        }
+
+        // Checks to make sure the footer is written correctly and returns the
+        // position of the file descriptor (which comes from the footer)
+        fn validate_footer(footer_bytes: &Bytes) -> Result<u64> {
+            let len = footer_bytes.len();
+            if len < 16 {
+                return Err(Error::IO {
+                    message: format!(
+                        "does not have sufficient data, len: {}, bytes: {:?}",
+                        len, footer_bytes
+                    ),
+                    location: location!(),
+                });
+            }
+            let magic_bytes = footer_bytes.slice(len - 4..len);
+            if magic_bytes.as_ref() != MAGIC {
+                return Err(Error::IO {
+                    message: format!(
+                        "file does not appear to be a Lance file (invalid magic: {:?})",
+                        MAGIC
+                    ),
+                    location: location!(),
+                });
+            }
+            let offset_bytes = footer_bytes.slice(len - 16..len - 8);
+            Ok(LittleEndian::read_u64(offset_bytes.as_ref()))
+        }
+
+        // TODO: Once we have coalesced I/O we should only read the column metadatas that we need
+        async fn read_all_column_metadata(
+            reader: &dyn Reader,
+            metadata: &pb::Metadata,
+        ) -> Result<Vec<pb::ColumnMetadata>> {
+            let column_metadata_start = metadata.column_metadata_start;
+            // This range includes both the offsets table and all of the column metadata
+            let column_metadata_range =
+                column_metadata_start as usize..metadata.manifest_position as usize;
+            let column_metadata_bytes = reader.get_range(column_metadata_range).await?;
+
+            // cmo == column_metadata_offsets
+            let cmo_table_size = 16 * metadata.num_columns as usize;
+            let cmo_table =
+                column_metadata_bytes.slice(column_metadata_bytes.len() - cmo_table_size..);
+
+            (0..metadata.num_columns)
+                .map(|col_idx| {
+                    let offset = (col_idx * 16) as usize;
+                    let position = LittleEndian::read_u64(&cmo_table[offset..offset + 8]);
+                    let length = LittleEndian::read_u64(&cmo_table[offset + 8..offset + 16]);
+                    let normalized_position = (position - column_metadata_start) as usize;
+                    let normalized_end = normalized_position + (length as usize);
+                    Ok(pb::ColumnMetadata::decode(
+                        &column_metadata_bytes[normalized_position..normalized_end],
+                    )?)
+                })
+                .collect::<Result<Vec<_>>>()
+        }
+
+        async fn read_file_metadata(
+            reader: &dyn Reader,
+            // TODO: apply projection
+            _projection: &Schema,
+        ) -> Result<CachedFileMetadata> {
+            // 1. read the metadata block and footer
+            let (tail_bytes, file_len) = Self::read_tail(reader).await?;
+            let metadata_pos = Self::validate_footer(&tail_bytes)?;
+            let metadata: pb::Metadata = if metadata_pos < file_len - tail_bytes.len() as u64 {
+                // We have not read the metadata bytes yet.
+                let md_end = file_len - 16;
+                let md_bytes = reader
+                    .get_range(metadata_pos as usize..md_end as usize)
+                    .await?;
+                pb::Metadata::decode(md_bytes)?
+            } else {
+                let offset = tail_bytes.len() - (file_len - metadata_pos) as usize;
+                pb::Metadata::decode(tail_bytes.slice(offset..tail_bytes.len() - 16))?
+            };
+
+            // 2. read the schema
+            let file_descriptor_pos = metadata.manifest_position;
+            let file_descriptor = if file_descriptor_pos < file_len - tail_bytes.len() as u64 {
+                // We have not read the file descriptor bytes yet.
+                let fd_bytes = reader
+                    .get_range(file_descriptor_pos as usize..metadata_pos as usize)
+                    .await?;
+                FileDescriptor::from(pb::FileDescriptor::decode(fd_bytes)?)
+            } else {
+                let offset = tail_bytes.len() - (file_len - file_descriptor_pos) as usize;
+                let md_offset = tail_bytes.len() - (file_len - metadata_pos) as usize;
+                FileDescriptor::from(pb::FileDescriptor::decode(
+                    tail_bytes.slice(offset..md_offset),
+                )?)
+            };
+
+            // Next, read the metadata for the columns
+            let column_metadatas = Self::read_all_column_metadata(reader, &metadata).await?;
+            let column_metadatas = file_descriptor
+                .schema
+                .fields
+                .iter()
+                .map(|f| f.id as u32)
+                .zip(column_metadatas.into_iter())
+                .collect::<HashMap<_, _>>();
+            Ok(CachedFileMetadata {
+                file_schema: file_descriptor.schema,
+                column_metadatas,
+                num_rows: file_descriptor.length,
+            })
+        }
+
+        /// Opens a new file reader without any pre-existing knowledge
+        ///
+        /// This will read the file schema and desired column metadata from the
+        pub async fn try_open(reader: Arc<dyn Reader>, projection: Schema) -> Result<Self> {
+            let file_metadata =
+                Arc::new(Self::read_file_metadata(reader.as_ref(), &projection).await?);
+            let num_rows = file_metadata.num_rows;
+            let file_decoder = Arc::new(FileDecoder::try_new(file_metadata, &projection)?);
+            Ok(Self {
+                object_reader: reader,
+                file_decoder,
+                projected_schema: projection,
+                num_rows,
+            })
+        }
+
+        fn read_range(
+            &self,
+            range: Range<u32>,
+            batch_size: u32,
+        ) -> impl Stream<Item = impl std::future::Future<Output = Result<RecordBatch>>> {
+            let (tx, rx) = mpsc::channel::<ScheduledPage>(50);
+            let num_rows = range.end - range.start;
+
+            // Spawn the scheduler (push-based)
+            let file_decoder = self.file_decoder.clone();
+            let reader = self.object_reader.clone();
+            let schedule_task = async move { file_decoder.schedule_loop(reader, range, tx).await };
+            tokio::task::spawn(schedule_task);
+
+            // Create the consumer (pull-based)
+            DecodeStream::new(
+                rx,
+                Arc::new(self.projected_schema.clone()),
+                num_rows,
+                batch_size,
+            )
+            .into_stream()
+        }
+
+        // TODO: change output to sendable record batch stream
+
+        pub fn read_stream(
+            &self,
+            params: ReadBatchParams,
+            batch_size: u32,
+        ) -> impl Stream<Item = Result<RecordBatch>> {
+            let futures_stream = match params {
+                ReadBatchParams::Indices(_) => todo!(),
+                ReadBatchParams::Range(range) => {
+                    // TODO: Make err
+                    assert!((range.end as u32) < self.num_rows);
+                    self.read_range(range.start as u32..range.end as u32, batch_size)
+                }
+                ReadBatchParams::RangeFrom(range) => {
+                    self.read_range(range.start as u32..self.num_rows, batch_size)
+                }
+                ReadBatchParams::RangeTo(range) => {
+                    // TODO: Make err
+                    assert!((range.end as u32) < self.num_rows);
+                    self.read_range(0..range.end as u32, batch_size)
+                }
+                ReadBatchParams::RangeFull => self.read_range(0..self.num_rows, batch_size),
+            };
+            futures_stream.buffered(1).boxed()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::writer::{FileWriter, NotSelfDescribing};

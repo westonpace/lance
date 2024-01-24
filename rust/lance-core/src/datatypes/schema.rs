@@ -406,6 +406,10 @@ impl Schema {
         self.fields.iter().map(|f| f.max_id()).max()
     }
 
+    pub fn num_top_level_fields(&self) -> u32 {
+        self.fields.len() as u32
+    }
+
     /// Recursively attach set up dictionary values to the dictionary fields.
     // TODO: pub(crate)
     pub fn set_dictionary(&mut self, batch: &RecordBatch) -> Result<()> {
