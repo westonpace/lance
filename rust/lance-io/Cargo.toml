@@ -37,13 +37,23 @@ prost.workspace = true
 shellexpand.workspace = true
 snafu.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 parquet.workspace = true
+pprof.workspace = true
 rand.workspace = true
 tempfile.workspace = true
+tracing-chrome = "0.7.1"
+tracing-subscriber = "0.3.17"
+
 
 [build-dependencies]
 prost-build.workspace = true
+
+[[bench]]
+name = "scheduler"
+harness = false

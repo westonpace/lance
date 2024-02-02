@@ -119,6 +119,7 @@ tokio = { version = "1.23", features = [
     "fs",
     "sync",
 ] }
+tokio-stream = { version = "0.1.14" }
 tracing = "0.1"
 url = "2.3"
 uuid = { version = "1.2", features = ["v4", "serde"] }

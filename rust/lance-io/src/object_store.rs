@@ -664,6 +664,7 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 .with_url(url.as_ref())
                 .with_credentials(aws_creds)
                 .with_region(region)
+                .with_s3_express(true)
                 .with_allow_http(true);
             let store = builder.build()?;
 
