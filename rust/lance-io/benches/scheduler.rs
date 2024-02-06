@@ -36,7 +36,7 @@ impl Display for FullReadParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "parallel={},read_size={}",
+            "full_read,parallel={},read_size={}",
             self.io_parallelism, self.page_size
         )
     }
@@ -151,7 +151,7 @@ impl Display for RandomReadParams {
 /// This benchmark creates a file with DATA_SIZE bytes which is then treated as
 /// a contiguous array of items with width `item_size`.  We read a random selection
 /// of INDICES_PER_ITER items from the array.  The selection is chosen randomly but
-/// sorted before reading (to mimic actually use and make coalescing easier)
+/// sorted before reading (to mimic actual use and make coalescing easier)
 fn bench_random_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("from_elem");
 

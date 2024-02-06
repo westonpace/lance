@@ -97,6 +97,12 @@ impl BatchRequest {
     }
 }
 
+impl Default for BatchRequest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // Every I/O task spawned will have a reference to this so that it can
 // store its results.  When this goes out of scope the data is delivered.
 struct MutableBatch {
@@ -120,7 +126,7 @@ struct DeliveredIndirect {
 
 impl MutableBatch {
     // Converts this into a LoadedBatch for delivery
-    fn into_loaded_batch(&mut self) -> LoadedBatch {
+    fn swap_into_loaded_batch(&mut self) -> LoadedBatch {
         let mut data_buffers = Vec::new();
         std::mem::swap(&mut self.data_buffers, &mut data_buffers);
         let mut offset_buffers = Vec::new();
@@ -166,11 +172,11 @@ impl Drop for MutableBatch {
         // If we have an error, return that.  Otherwise return the data
         let result = if self.err.is_some() {
             Err(Error::Wrapped {
-                error: self.err.take().unwrap().into(),
+                error: self.err.take().unwrap(),
                 location: location!(),
             })
         } else {
-            Ok(self.into_loaded_batch())
+            Ok(self.swap_into_loaded_batch())
         };
         // We don't really care if no one is around to receive it, just let
         // the result go out of scope and get cleaned up
@@ -347,7 +353,7 @@ async fn run_io_loop(tasks: mpsc::UnboundedReceiver<IoTask>, io_capacity: u32) {
             task
         })
         .buffer_unordered(io_capacity as usize);
-    while let Some(_) = task_stream.next().await {
+    while task_stream.next().await.is_some() {
         // We don't actually do anything with the results here, they are sent
         // via the io tasks's when_done.  Instead we just keep chugging away
         // indefinitely until the tasks receiver returns none (scheduler has
@@ -372,6 +378,16 @@ impl StoreScheduler {
     /// - object_store: the store to wrap
     /// - io_capacity: the maximum number of parallel requests that will be allowed
     pub fn new(object_store: Arc<ObjectStore>, io_capacity: u32) -> Self {
+        // TODO: we don't have any backpressure in place if the compute thread falls
+        // behind.  The scheduler thread will schedule ALL of the I/O and then the
+        // loaded data will eventually pile up.
+        //
+        // We could bound this channel but that wouldn't help.  If the decode thread
+        // was paused then the I/O loop would keep running and reading from this channel.
+        //
+        // Once the reader is finished we should revisit.  We will probably want to convert
+        // from `when_done` futures to delivering data into a queue.  That queue should fill
+        // up, causing the I/O loop to pause.
         let (tx, rx) = mpsc::unbounded_channel();
         let scheduler = Self {
             object_store,
@@ -434,9 +450,6 @@ mod tests {
     use object_store::path::Path;
     use rand::RngCore;
     use tempfile::tempdir;
-    use tracing::subscriber;
-    use tracing_chrome::{ChromeLayerBuilder, TraceStyle};
-    use tracing_subscriber::{filter, prelude::*, Layer, Registry};
 
     use super::*;
 
@@ -491,17 +504,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_indirect_read() {
-        let builder = ChromeLayerBuilder::new()
-            .trace_style(TraceStyle::Async)
-            .include_args(true);
-        let (chrome_layer, _guard) = builder.build();
-        // Narrow down to just our targets, otherwise we get a lot of spam from
-        // our dependencies. The target check is based on a prefix, so `lance` is
-        // sufficient to match `lance_*`.
-        let filter = filter::Targets::new().with_target("lance", filter::LevelFilter::DEBUG);
-        let subscriber = Registry::default().with(chrome_layer.with_filter(filter));
-        subscriber::set_global_default(subscriber).unwrap();
-
         let tmpdir = tempdir().unwrap();
         let tmp_path = tmpdir.path().to_str().unwrap();
         let tmp_path = Path::parse(tmp_path).unwrap();
