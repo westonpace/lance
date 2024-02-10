@@ -60,7 +60,7 @@ async fn create_data(num_bytes: u64) -> (Arc<ObjectStore>, Path) {
 
 const DATA_SIZE: u64 = 128 * 1024 * 1024;
 
-async fn drain_task<F: std::future::Future<Output = Result<LoadedBatch>>>(
+async fn drain_task<F: std::future::Future<Output = Result<LoadedBatch<()>>>>(
     mut rx: tokio::sync::mpsc::Receiver<F>,
 ) -> u64 {
     let mut bytes_received = 0;
@@ -112,8 +112,8 @@ fn bench_full_read(c: &mut Criterion) {
                         let drainer = tokio::spawn(drain_task(rx));
                         let mut offset = 0;
                         while offset < DATA_SIZE {
-                            let mut req = BatchRequest::new();
-                            req.direct_read(offset..(offset + params.page_size));
+                            let req =
+                                BatchRequest::new_simple(vec![offset..(offset + params.page_size)]);
                             let req = file_scheduler.submit_request(req);
                             tx.send(req).await.unwrap();
                             offset += params.page_size;
@@ -198,13 +198,15 @@ fn bench_random_read(c: &mut Criterion) {
                             let drainer = tokio::spawn(drain_task(rx));
                             let mut idx = 0;
                             while idx < params.indices.len() {
-                                let mut req = BatchRequest::new();
-                                for _ in 0..INDICES_PER_BATCH {
-                                    let start = idx as u64 * params.item_size as u64;
-                                    let end = start + params.item_size as u64;
-                                    req.direct_read(start..end);
-                                    idx += 1;
-                                }
+                                let iops = (idx..(idx + INDICES_PER_BATCH as usize))
+                                    .map(|idx| {
+                                        let start = idx as u64 * params.item_size as u64;
+                                        let end = start + params.item_size as u64;
+                                        start..end
+                                    })
+                                    .collect::<Vec<_>>();
+                                idx += INDICES_PER_BATCH as usize;
+                                let req = BatchRequest::new_simple(iops);
                                 let req = file_scheduler.submit_request(req);
                                 tx.send(req).await.unwrap();
                             }

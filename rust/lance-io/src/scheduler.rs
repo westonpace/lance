@@ -12,153 +12,128 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow_array::UInt32Array;
-use arrow_buffer::{Buffer, ScalarBuffer};
 use bytes::Bytes;
 use futures::channel::oneshot;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use object_store::path::Path;
 use snafu::{location, Location};
 use std::future::Future;
-use std::mem::size_of;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_stream::Stream;
 
 use lance_core::{Error, Result};
 
 use crate::object_store::ObjectStore;
 use crate::traits::Reader;
 
-// A request for a single range of data
-struct DirectIoRequest {
-    range: Range<u64>,
+type FollowUpTask<C> = Box<dyn FnOnce(C, Vec<Bytes>) -> BatchRequest<C> + Send>;
+
+/// A collection of requested I/O operations with an optional follow-up task
+pub struct BatchRequest<C: Send> {
+    iops: Vec<Range<u64>>,
+    context: C,
+    follow_up: Option<FollowUpTask<C>>,
 }
 
-// A request to fetch a single range of data indirectly
-struct IndirectIoRequest {
-    offsets_range: Range<u64>,
-    data_offset: u64,
-}
-
-/// A collection of requested I/O operations
-pub struct BatchRequest {
-    direct_requests: Vec<DirectIoRequest>,
-    indirect_requests: Vec<IndirectIoRequest>,
-}
-
-impl BatchRequest {
-    /// Create an empty request
-    pub fn new() -> Self {
+impl BatchRequest<()> {
+    /// Create a new simple request with no context or follow-up
+    ///
+    /// # Arguments
+    ///
+    /// * iops - the ranges to request.  There will be one `Bytes`
+    ///   instance in the response for each range (even if some
+    ///   ranges are coalesced).  For best performance these should
+    ///   be sorted so that the end of each range is less than or
+    ///   equal to the start of the next range
+    pub fn new_simple(iops: Vec<Range<u64>>) -> Self {
         Self {
-            direct_requests: Vec::new(),
-            indirect_requests: Vec::new(),
+            iops,
+            context: (),
+            follow_up: None,
+        }
+    }
+}
+
+impl<C: Send> BatchRequest<C> {
+    /// Create a new request with context
+    ///
+    /// The context will be delivered with the response.
+    ///
+    /// # Arguments
+    ///
+    /// * iops - the ranges to request.  See [`Self::new_simple`] for
+    ///   more details
+    /// * context - a context object.  This will be delivered with the
+    ///   response.
+    pub fn new_with_context(iops: Vec<Range<u64>>, context: C) -> Self {
+        Self {
+            iops,
+            context,
+            follow_up: None,
         }
     }
 
-    /// Add a request to read a specified range of bytes from the disk
-    pub fn direct_read(&mut self, range: Range<u64>) {
-        self.direct_requests.push(DirectIoRequest { range })
-    }
-
-    /// Add a request to read a range of bytes from disk indirectly
+    /// Create a new request with context and a follow-up
     ///
-    /// This assumes that the offsets of the the desired data are
-    /// written somewhere.  It first reads those offsets and then reads
-    /// the range specified by those offsets.
+    /// The context will be delivered to the follow-up task and, eventually,
+    /// to the response.
     ///
-    /// For example, if the offsets are written to the start of the file
+    /// The follow-up task will be given the loaded data and then is expected
+    /// to generate an additional request.  For example, this is used when
+    /// doing an indirect load where the offsets or sizes of the desired data
+    /// are stored on disk.
     ///
-    /// [0]: 100
-    /// [4]: 120
-    /// [8]: 300
-    /// [12]: 330
+    /// # Arguments
     ///
-    /// And the request has offsets_range: 4..16 then it will
-    /// first read those offsets (120, 300, and 330) and then read that range
-    /// (120..330) from the disk.
-    ///
-    /// All offsets are assumed to be little endian u32 values.
-    ///
-    /// A `data_offset` can be supplied which will be added to the range
-    /// used to access the data.  This allows offset buffers to store
-    /// "buffer offsets" instead of "file offsets".
-    ///
-    /// The offset values themselves will be saved as well.  This
-    /// can be used to recover the length of the individual items.
-    pub fn indirect_read(&mut self, offsets_range: Range<u64>, data_offset: u64) {
-        self.indirect_requests.push(IndirectIoRequest {
-            offsets_range,
-            data_offset,
-        })
+    /// * iops - the ranges to request.  See [`Self::new_simple`] for
+    ///   more details
+    /// * context - a context object.  This will be delivered with the
+    ///   response.
+    /// * follow_up - a follow up task that will generate the next chunk
+    ///   of I/O operations
+    pub fn new_with_follow_up<F: FnOnce(C, Vec<Bytes>) -> BatchRequest<C> + Send + 'static>(
+        iops: Vec<Range<u64>>,
+        context: C,
+        follow_up: F,
+    ) -> Self {
+        Self {
+            iops,
+            context,
+            follow_up: Some(Box::new(follow_up)),
+        }
     }
 }
 
-impl Default for BatchRequest {
-    fn default() -> Self {
-        Self::new()
-    }
+// A batch of data loaded in response to a BatchRequest
+pub struct LoadedBatch<C: Send> {
+    /// The loaded data, grouped into one or more data buffers
+    ///
+    /// Each requested Range will result in exactly one `Bytes` object in this
+    /// result.  This is true even if the ranges were coalesced into a single
+    /// read by the scheduler.
+    pub data_buffers: Vec<Bytes>,
+    /// The context object that was provided with the original request.
+    pub context: C,
 }
 
-// Every I/O task spawned will have a reference to this so that it can
-// store its results.  When this goes out of scope the data is delivered.
-struct MutableBatch {
-    when_done: Option<oneshot::Sender<Result<LoadedBatch>>>,
+// There is one instance of MutableBatch shared by all the I/O operations
+// that make up a single BatchRequest.  When all the I/O operations complete
+// then the MutableBatch goes out of scope and the batch request is considered
+// complete
+struct MutableBatch<F: FnOnce(Result<Vec<Bytes>>) -> () + Send> {
+    when_done: Option<F>,
     data_buffers: Vec<Bytes>,
-    offset_buffers: Vec<UInt32Array>,
     err: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
 }
 
-struct DeliveredDirect {
-    idx: u32,
-    data: Bytes,
-}
-
-struct DeliveredIndirect {
-    data_idx: u32,
-    data: Bytes,
-    offset_idx: u32,
-    offsets: UInt32Array,
-}
-
-impl MutableBatch {
-    // Converts this into a LoadedBatch for delivery
-    fn swap_into_loaded_batch(&mut self) -> LoadedBatch {
-        let mut data_buffers = Vec::new();
-        std::mem::swap(&mut self.data_buffers, &mut data_buffers);
-        let mut offset_buffers = Vec::new();
-        std::mem::swap(&mut self.offset_buffers, &mut offset_buffers);
-        LoadedBatch {
-            data_buffers,
-            offset_buffers,
-        }
-    }
-
-    // Called by worker tasks to add data to the MutableBatch
-    fn deliver_direct(&mut self, data: Result<DeliveredDirect>) {
-        match data {
-            Ok(data) => {
-                self.data_buffers[data.idx as usize] = data.data;
-            }
-            Err(err) => {
-                // This keeps the original error, if present
-                self.err.get_or_insert(Box::new(err));
-            }
-        }
-    }
-
-    fn deliver_indirect(&mut self, data: Result<DeliveredIndirect>) {
-        match data {
-            Ok(data) => {
-                self.data_buffers[data.data_idx as usize] = data.data;
-                self.offset_buffers[data.offset_idx as usize] = data.offsets;
-            }
-            Err(err) => {
-                self.err.get_or_insert(Box::new(err));
-            }
+impl<F: FnOnce(Result<Vec<Bytes>>) -> () + Send> MutableBatch<F> {
+    fn new(when_done: F, num_data_buffers: u32) -> Self {
+        Self {
+            when_done: Some(when_done),
+            data_buffers: vec![Bytes::default(); num_data_buffers as usize],
+            err: None,
         }
     }
 }
@@ -167,7 +142,7 @@ impl MutableBatch {
 // can deliver the batch of data we let Rust do that for us.  When all I/O's are
 // done then the MutableBatch will go out of scope and we know we have all the
 // data.
-impl Drop for MutableBatch {
+impl<F: FnOnce(Result<Vec<Bytes>>) -> () + Send> Drop for MutableBatch<F> {
     fn drop(&mut self) {
         // If we have an error, return that.  Otherwise return the data
         let result = if self.err.is_some() {
@@ -176,183 +151,93 @@ impl Drop for MutableBatch {
                 location: location!(),
             })
         } else {
-            Ok(self.swap_into_loaded_batch())
+            let mut data = Vec::new();
+            std::mem::swap(&mut data, &mut self.data_buffers);
+            Ok(data)
         };
         // We don't really care if no one is around to receive it, just let
         // the result go out of scope and get cleaned up
-        let _ = self.when_done.take().unwrap().send(result);
+        let _ = (self.when_done.take().unwrap())(result);
     }
 }
 
-type MutableBatchRef = Arc<Mutex<MutableBatch>>;
-
-// An IoTask represents a stream of futures that will be used to load
-// the data requested by a single BatchRequest
-struct IoTask {
-    // The original request
-    request: BatchRequest,
-    // The file we are reading from
-    reader: Arc<dyn Reader>,
-    // Where to put the bytes.  Initially blank until the task is allocated.
-    dest: Option<MutableBatchRef>,
-    // Where to deliver the bytes when all is done.  When this task is allocated
-    // the sender will be moved out of here and into `dest`.
-    when_done: Option<oneshot::Sender<Result<LoadedBatch>>>,
-    // The current position of the stream in request.indirect_requests
-    indirect_index: usize,
-    // The current position of the stream inrequest.direct_requests
-    direct_index: usize,
+trait DataSink: Send {
+    fn deliver_data(&mut self, data: Result<(usize, Bytes)>);
 }
 
-impl IoTask {
-    fn new(
-        request: BatchRequest,
-        reader: Arc<dyn Reader>,
-        when_done: oneshot::Sender<Result<LoadedBatch>>,
-    ) -> Self {
-        Self {
-            request,
-            reader,
-            dest: None,
-            when_done: Some(when_done),
-            indirect_index: 0,
-            direct_index: 0,
+impl<F: FnOnce(Result<Vec<Bytes>>) -> () + Send> DataSink for MutableBatch<F> {
+    // Called by worker tasks to add data to the MutableBatch
+    fn deliver_data(&mut self, data: Result<(usize, Bytes)>) {
+        match data {
+            Ok(data) => {
+                self.data_buffers[data.0] = data.1;
+            }
+            Err(err) => {
+                // This keeps the original error, if present
+                self.err.get_or_insert(Box::new(err));
+            }
         }
     }
+}
 
-    fn spawn_direct(&mut self, task_idx: usize) -> tokio::task::JoinHandle<()> {
-        let task = &self.request.direct_requests[task_idx];
+struct InnerIoTask {
+    reader: Arc<dyn Reader>,
+    to_read: Range<u64>,
+    when_done: Box<dyn FnOnce(Result<Bytes>) -> () + Send>,
+}
 
-        let reader = self.reader.clone();
-        let dest = self.dest.as_ref().unwrap().clone();
-        let range = (task.range.start as usize)..(task.range.end as usize);
-
-        tokio::spawn(async move {
-            let bytes = reader.get_range(range).await;
-            let mut dest = dest.lock().unwrap();
-            dest.deliver_direct(bytes.map(|bytes| DeliveredDirect {
-                data: bytes,
-                idx: task_idx as u32,
-            }));
-        })
-    }
-
-    async fn do_indirect(
-        reader: Arc<dyn Reader>,
-        offsets_range: Range<u64>,
-        data_offset: u64,
-        data_idx: u32,
-        offset_idx: u32,
-    ) -> Result<DeliveredIndirect> {
-        let bytes = reader
-            .get_range(offsets_range.start as usize..offsets_range.end as usize)
-            .await?;
-        let length = bytes.len() / size_of::<u32>();
-        let values = ScalarBuffer::new(Buffer::from_bytes(bytes.into()), 0, length);
-        let offsets = UInt32Array::new(values, None);
-
-        let start = offsets.value(0);
-        let end = offsets.value(offsets.len() - 1);
-        let start = start as usize + data_offset as usize;
-        let end = end as usize + data_offset as usize;
-        let data_bytes = reader.get_range(start..end).await?;
-
-        Ok(DeliveredIndirect {
-            data_idx,
-            data: data_bytes,
-            offset_idx,
-            offsets,
-        })
-    }
-
-    fn spawn_indirect(&self, offset_idx: usize) -> JoinHandle<()> {
-        let data_idx = self.request.direct_requests.len() + offset_idx;
-        let task = &self.request.indirect_requests[offset_idx];
-
-        let reader = self.reader.clone();
-        let dest = self.dest.as_ref().unwrap().clone();
-        let offsets_range = task.offsets_range.clone();
-        let data_offset = task.data_offset;
-
-        tokio::spawn(async move {
-            let to_deliver = Self::do_indirect(
-                reader,
-                offsets_range,
-                data_offset,
-                data_idx as u32,
-                offset_idx as u32,
-            )
+impl InnerIoTask {
+    async fn run(self) {
+        let bytes = self
+            .reader
+            .get_range(self.to_read.start as usize..self.to_read.end as usize)
             .await;
-            let mut dest = dest.lock().unwrap();
-            dest.deliver_indirect(to_deliver);
-        })
-    }
-
-    // We don't want to allocate a task as soon as it is created so this is
-    // deferred.  This should be called once a task is ready to start working
-    // and before it is consumed as a stream.
-    fn allocate(&mut self) {
-        let num_data_buffers =
-            self.request.direct_requests.len() + self.request.indirect_requests.len();
-        let data_buffers = vec![Bytes::default(); num_data_buffers];
-
-        let num_offset_buffers = self.request.indirect_requests.len();
-        let default_arr = UInt32Array::new_null(0);
-        let offset_buffers = vec![default_arr; num_offset_buffers];
-
-        self.dest = Some(Arc::new(Mutex::new(MutableBatch {
-            data_buffers,
-            offset_buffers,
-            when_done: self.when_done.take(),
-            err: None,
-        })));
+        (self.when_done)(bytes);
     }
 }
 
-impl Stream for IoTask {
-    type Item = JoinHandle<()>;
+// Combines two task receivers into a single stream of tasks
+//
+// If both receivers have data then items from the priority
+// queue will always be taken first.
+struct IoQueues {
+    regular_queue: mpsc::UnboundedReceiver<InnerIoTask>,
+    priority_queue: mpsc::UnboundedReceiver<InnerIoTask>,
+}
+
+impl Stream for IoQueues {
+    type Item = InnerIoTask;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        // This task_index is wrong because it doesn't take into account multiple buffers
-        if self.indirect_index < self.request.indirect_requests.len() {
-            let task_index = self.indirect_index;
-            self.indirect_index += 1;
-            std::task::Poll::Ready(Some(self.spawn_indirect(task_index)))
-        } else if self.direct_index < self.request.direct_requests.len() {
-            let task_index = self.request.indirect_requests.len() + self.direct_index;
-            self.direct_index += 1;
-            std::task::Poll::Ready(Some(self.spawn_direct(task_index)))
-        } else {
-            std::task::Poll::Ready(None)
+        // If neither stream is ready then we will poll both of them
+        // and they will both register a waker with cx.  So we should get
+        // woken when either receiver receives an item
+        match self.priority_queue.poll_recv(cx) {
+            Poll::Ready(task) => {
+                return Poll::Ready(task);
+            }
+            _ => {}
         }
+        self.regular_queue.poll_recv(cx)
     }
-}
-
-// A batch of data loaded in response to a BatchRequest
-pub struct LoadedBatch {
-    /// The loaded data, grouped into one or more data buffers
-    ///
-    /// Each call to [`BatchRequest::direct_read`] or [`BatchRequest::indirect_read`]
-    /// will result in exactly one `Bytes` object in this result.
-    pub data_buffers: Vec<Bytes>,
-    /// If there are indirect reads then the file offsets will be placed into this
-    /// buffer.  This can be used to retrieve the lengths of the individual items.
-    pub offset_buffers: Vec<UInt32Array>,
 }
 
 // Every time a scheduler starts up it launches a task to run the I/O loop.  This loop
 // repeats endlessly until the scheduler is destroyed.
-async fn run_io_loop(tasks: mpsc::UnboundedReceiver<IoTask>, io_capacity: u32) {
-    let task_stream = UnboundedReceiverStream::new(tasks);
-    let mut task_stream = task_stream
-        .flat_map(|mut task| {
-            task.allocate();
-            task
-        })
-        .buffer_unordered(io_capacity as usize);
+async fn run_io_loop(
+    tasks: mpsc::UnboundedReceiver<InnerIoTask>,
+    priority_tasks: mpsc::UnboundedReceiver<InnerIoTask>,
+    io_capacity: u32,
+) {
+    let io_queues = IoQueues {
+        priority_queue: priority_tasks,
+        regular_queue: tasks,
+    };
+    let task_stream = io_queues.map(|task| tokio::spawn(task.run()));
+    let mut task_stream = task_stream.buffer_unordered(io_capacity as usize);
     while task_stream.next().await.is_some() {
         // We don't actually do anything with the results here, they are sent
         // via the io tasks's when_done.  Instead we just keep chugging away
@@ -361,13 +246,14 @@ async fn run_io_loop(tasks: mpsc::UnboundedReceiver<IoTask>, io_capacity: u32) {
     }
 }
 
-/// Wraps an ObjectStore and throttles the amount of parallel I/O that can
-/// be run.
+/// An I/O scheduler which wraps an ObjectStore and throttles the amount of\
+/// parallel I/O that can be run.
 ///
 /// TODO: This will also add coalescing
 pub struct StoreScheduler {
     object_store: Arc<ObjectStore>,
-    task_submitter: mpsc::UnboundedSender<IoTask>,
+    io_submitter: mpsc::UnboundedSender<InnerIoTask>,
+    priority_sender: Arc<mpsc::UnboundedSender<InnerIoTask>>,
 }
 
 impl StoreScheduler {
@@ -375,8 +261,8 @@ impl StoreScheduler {
     ///
     /// # Arguments
     ///
-    /// - object_store: the store to wrap
-    /// - io_capacity: the maximum number of parallel requests that will be allowed
+    /// * object_store - the store to wrap
+    /// * io_capacity - the maximum number of parallel requests that will be allowed
     pub fn new(object_store: Arc<ObjectStore>, io_capacity: u32) -> Self {
         // TODO: we don't have any backpressure in place if the compute thread falls
         // behind.  The scheduler thread will schedule ALL of the I/O and then the
@@ -388,12 +274,14 @@ impl StoreScheduler {
         // Once the reader is finished we should revisit.  We will probably want to convert
         // from `when_done` futures to delivering data into a queue.  That queue should fill
         // up, causing the I/O loop to pause.
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (reg_tx, reg_rx) = mpsc::unbounded_channel();
+        let (priority_tx, priority_rx) = mpsc::unbounded_channel();
         let scheduler = Self {
             object_store,
-            task_submitter: tx,
+            io_submitter: reg_tx,
+            priority_sender: Arc::new(priority_tx),
         };
-        tokio::task::spawn(async move { run_io_loop(rx, io_capacity).await });
+        tokio::task::spawn(async move { run_io_loop(reg_rx, priority_rx, io_capacity).await });
         scheduler
     }
 
@@ -406,16 +294,85 @@ impl StoreScheduler {
         })
     }
 
-    fn submit_request(
+    fn do_submit_request<C: Send + 'static>(
+        reader: Arc<dyn Reader>,
+        request: BatchRequest<C>,
+        tx: oneshot::Sender<Result<LoadedBatch<C>>>,
+        priority_submitter: Arc<mpsc::UnboundedSender<InnerIoTask>>,
+        this_submitter: &mpsc::UnboundedSender<InnerIoTask>,
+    ) {
+        let num_iops = request.iops.len() as u32;
+
+        let context = request.context;
+        let follow_up = request.follow_up;
+        let reader_clone = reader.clone();
+
+        let when_all_io_done = move |bytes| {
+            match bytes {
+                Ok(bytes) => {
+                    if let Some(follow_up) = follow_up {
+                        // The current future is on the I/O critical path.  If the follow
+                        // up requires any significant CPU work then it will block
+                        // the I/O threads and so we run the follow-up in a new task
+                        tokio::task::spawn(async move {
+                            let next_req = (follow_up)(context, bytes);
+                            Self::do_submit_request(
+                                reader_clone,
+                                next_req,
+                                tx,
+                                priority_submitter.clone(),
+                                &priority_submitter,
+                            );
+                        });
+                    } else {
+                        let _ = tx.send(Ok(LoadedBatch {
+                            data_buffers: bytes,
+                            context,
+                        }));
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err));
+                }
+            };
+        };
+
+        let dest = Arc::new(Mutex::new(Box::new(MutableBatch::new(
+            when_all_io_done,
+            num_iops,
+        ))));
+
+        for (task_idx, iop) in request.iops.into_iter().enumerate() {
+            let dest = dest.clone();
+            let task = InnerIoTask {
+                reader: reader.clone(),
+                to_read: iop,
+                when_done: Box::new(move |bytes| {
+                    let mut dest = dest.lock().unwrap();
+                    dest.deliver_data(bytes.map(|bytes| (task_idx, bytes)));
+                }),
+            };
+            this_submitter
+                .send(task)
+                .expect("I/O scheduler thread panic'd");
+        }
+    }
+
+    fn submit_request<C: Send + 'static>(
         &self,
         reader: Arc<dyn Reader>,
-        request: BatchRequest,
-    ) -> impl Future<Output = Result<LoadedBatch>> + Send {
-        let (tx, rx) = oneshot::channel::<Result<LoadedBatch>>();
-        let io_task = IoTask::new(request, reader, tx);
-        // We can unwrap here because the only possible error could be that the receiver
-        // has shut down but that should only happen if the receiver had a panic.
-        self.task_submitter.send(io_task).unwrap();
+        request: BatchRequest<C>,
+    ) -> impl Future<Output = Result<LoadedBatch<C>>> + Send {
+        let (tx, rx) = oneshot::channel::<Result<LoadedBatch<C>>>();
+
+        Self::do_submit_request(
+            reader,
+            request,
+            tx,
+            self.priority_sender.clone(),
+            &self.io_submitter,
+        );
+
         // Right now, it isn't possible for I/O to be cancelled so a cancel error should
         // not occur
         rx.map(|wrapped_err| wrapped_err.unwrap())
@@ -433,18 +390,20 @@ impl<'a> FileScheduler<'a> {
     ///
     /// The requests will be queued in a FIFO manner and, when all requests
     /// have been fulfilled, the returned future will be completed.
-    pub fn submit_request(
+    pub fn submit_request<C: Send + 'static>(
         &self,
-        request: BatchRequest,
-    ) -> impl Future<Output = Result<LoadedBatch>> + Send {
+        request: BatchRequest<C>,
+    ) -> impl Future<Output = Result<LoadedBatch<C>>> + Send {
         self.root.submit_request(self.reader.clone(), request)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, mem::size_of};
 
+    use arrow_array::UInt32Array;
+    use arrow_buffer::ScalarBuffer;
     use byteorder::{LittleEndian, WriteBytesExt};
     use bytes::BufMut;
     use object_store::path::Path;
@@ -479,12 +438,7 @@ mod tests {
         while offset < DATA_SIZE {
             reqs.push_back(
                 file_scheduler
-                    .submit_request(BatchRequest {
-                        direct_requests: vec![DirectIoRequest {
-                            range: offset..offset + READ_SIZE,
-                        }],
-                        indirect_requests: vec![],
-                    })
+                    .submit_request(BatchRequest::new_simple(vec![offset..offset + READ_SIZE]))
                     .await
                     .unwrap(),
             );
@@ -500,6 +454,31 @@ mod tests {
             assert_eq!(expected, actual);
             offset += READ_SIZE;
         }
+    }
+
+    struct IndirectReadContext {
+        base_offset: u64,
+        offsets: Option<Vec<UInt32Array>>,
+    }
+
+    fn indirect_read_follow_up(
+        mut context: IndirectReadContext,
+        data: Vec<Bytes>,
+    ) -> BatchRequest<IndirectReadContext> {
+        let (iops, offsets): (Vec<_>, Vec<_>) = data
+            .into_iter()
+            .map(|bytes| {
+                let length = bytes.len() / size_of::<u32>();
+                debug_assert!(length > 1);
+                let offsets = ScalarBuffer::<u32>::new(bytes.into(), 0, length);
+                let start = context.base_offset + offsets[0] as u64;
+                let end = context.base_offset + offsets[length - 1] as u64;
+                let offsets = UInt32Array::new(offsets, None);
+                (start..end, offsets)
+            })
+            .unzip();
+        context.offsets = Some(offsets);
+        BatchRequest::new_with_context(iops, context)
     }
 
     #[tokio::test]
@@ -535,28 +514,40 @@ mod tests {
         let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
 
         // Read it back in one big read
-        let mut req = BatchRequest::new();
-        req.indirect_read(0..OFFSET_SIZE, OFFSET_SIZE);
+        let indirect_context = IndirectReadContext {
+            base_offset: OFFSET_SIZE,
+            offsets: None,
+        };
+        let req = BatchRequest::new_with_follow_up(
+            vec![0..OFFSET_SIZE],
+            indirect_context,
+            |context, data| indirect_read_follow_up(context, data),
+        );
         let data = file_scheduler.submit_request(req).await.unwrap();
 
-        assert_eq!(data.offset_buffers.len(), 1);
         assert_eq!(data.data_buffers.len(), 1);
         assert_eq!(data.data_buffers[0], some_data[OFFSET_SIZE as usize..]);
-        assert!(data.offset_buffers[0]
+
+        let offsets = data.context.offsets.unwrap().into_iter().next().unwrap();
+        assert!(offsets
             .values()
             .iter()
             .enumerate()
             .all(|(idx, len)| *len == (idx as u32 * STRING_WIDTH as u32)));
 
-        // Read it back in batches
+        // // Read it back in batches
         let mut reqs = VecDeque::new();
         let mut offset = 0;
         const BATCH_SIZE: u64 = 1024 * size_of::<u32>() as u64;
-        while offset < DATA_SIZE {
-            let mut req = BatchRequest::new();
-            req.indirect_read(
-                offset..offset + BATCH_SIZE + size_of::<u32>() as u64,
-                OFFSET_SIZE,
+        while offset < OFFSET_SIZE {
+            let indirect_context = IndirectReadContext {
+                base_offset: OFFSET_SIZE,
+                offsets: None,
+            };
+            let req = BatchRequest::new_with_follow_up(
+                vec![offset..offset + BATCH_SIZE + size_of::<u32>() as u64],
+                indirect_context,
+                |context, data| indirect_read_follow_up(context, data),
             );
             reqs.push_back(file_scheduler.submit_request(req));
             offset += BATCH_SIZE;
