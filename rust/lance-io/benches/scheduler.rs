@@ -70,7 +70,7 @@ async fn drain_task<F: std::future::Future<Output = Result<LoadedBatch<()>>>>(
             .data_buffers
             .iter()
             .map(|bytes| bytes.len() as u64)
-            .sum::<u64>() as u64;
+            .sum::<u64>();
     }
     bytes_received
 }
