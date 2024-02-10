@@ -112,6 +112,7 @@ fn bench_full_read(c: &mut Criterion) {
                         let drainer = tokio::spawn(drain_task(rx));
                         let mut offset = 0;
                         while offset < DATA_SIZE {
+                            #[allow(clippy::single_range_in_vec_init)]
                             let req =
                                 BatchRequest::new_simple(vec![offset..(offset + params.page_size)]);
                             let req = file_scheduler.submit_request(req);

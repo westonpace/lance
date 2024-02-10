@@ -93,7 +93,7 @@ impl<C: Send> BatchRequest<C> {
     ///   response.
     /// * follow_up - a follow up task that will generate the next chunk
     ///   of I/O operations
-    pub fn new_with_follow_up<F: FnOnce(C, Vec<Bytes>) -> BatchRequest<C> + Send + 'static>(
+    pub fn new_with_follow_up<F: FnOnce(C, Vec<Bytes>) -> Self + Send + 'static>(
         iops: Vec<Range<u64>>,
         context: C,
         follow_up: F,
@@ -122,13 +122,13 @@ pub struct LoadedBatch<C: Send> {
 // that make up a single BatchRequest.  When all the I/O operations complete
 // then the MutableBatch goes out of scope and the batch request is considered
 // complete
-struct MutableBatch<F: FnOnce(Result<Vec<Bytes>>) -> () + Send> {
+struct MutableBatch<F: FnOnce(Result<Vec<Bytes>>) + Send> {
     when_done: Option<F>,
     data_buffers: Vec<Bytes>,
     err: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
 }
 
-impl<F: FnOnce(Result<Vec<Bytes>>) -> () + Send> MutableBatch<F> {
+impl<F: FnOnce(Result<Vec<Bytes>>) + Send> MutableBatch<F> {
     fn new(when_done: F, num_data_buffers: u32) -> Self {
         Self {
             when_done: Some(when_done),
@@ -142,7 +142,7 @@ impl<F: FnOnce(Result<Vec<Bytes>>) -> () + Send> MutableBatch<F> {
 // can deliver the batch of data we let Rust do that for us.  When all I/O's are
 // done then the MutableBatch will go out of scope and we know we have all the
 // data.
-impl<F: FnOnce(Result<Vec<Bytes>>) -> () + Send> Drop for MutableBatch<F> {
+impl<F: FnOnce(Result<Vec<Bytes>>) + Send> Drop for MutableBatch<F> {
     fn drop(&mut self) {
         // If we have an error, return that.  Otherwise return the data
         let result = if self.err.is_some() {
@@ -157,7 +157,7 @@ impl<F: FnOnce(Result<Vec<Bytes>>) -> () + Send> Drop for MutableBatch<F> {
         };
         // We don't really care if no one is around to receive it, just let
         // the result go out of scope and get cleaned up
-        let _ = (self.when_done.take().unwrap())(result);
+        (self.when_done.take().unwrap())(result);
     }
 }
 
@@ -165,7 +165,7 @@ trait DataSink: Send {
     fn deliver_data(&mut self, data: Result<(usize, Bytes)>);
 }
 
-impl<F: FnOnce(Result<Vec<Bytes>>) -> () + Send> DataSink for MutableBatch<F> {
+impl<F: FnOnce(Result<Vec<Bytes>>) + Send> DataSink for MutableBatch<F> {
     // Called by worker tasks to add data to the MutableBatch
     fn deliver_data(&mut self, data: Result<(usize, Bytes)>) {
         match data {
@@ -183,7 +183,7 @@ impl<F: FnOnce(Result<Vec<Bytes>>) -> () + Send> DataSink for MutableBatch<F> {
 struct InnerIoTask {
     reader: Arc<dyn Reader>,
     to_read: Range<u64>,
-    when_done: Box<dyn FnOnce(Result<Bytes>) -> () + Send>,
+    when_done: Box<dyn FnOnce(Result<Bytes>) + Send>,
 }
 
 impl InnerIoTask {
@@ -215,11 +215,8 @@ impl Stream for IoQueues {
         // If neither stream is ready then we will poll both of them
         // and they will both register a waker with cx.  So we should get
         // woken when either receiver receives an item
-        match self.priority_queue.poll_recv(cx) {
-            Poll::Ready(task) => {
-                return Poll::Ready(task);
-            }
-            _ => {}
+        if let Poll::Ready(task) = self.priority_queue.poll_recv(cx) {
+            return Poll::Ready(task);
         }
         self.regular_queue.poll_recv(cx)
     }
@@ -437,6 +434,7 @@ mod tests {
         let mut offset = 0;
         while offset < DATA_SIZE {
             reqs.push_back(
+                #[allow(clippy::single_range_in_vec_init)]
                 file_scheduler
                     .submit_request(BatchRequest::new_simple(vec![offset..offset + READ_SIZE]))
                     .await
@@ -456,6 +454,7 @@ mod tests {
         }
     }
 
+    // This simulates the variable sized binary decoder
     struct IndirectReadContext {
         base_offset: u64,
         offsets: Option<Vec<UInt32Array>>,
@@ -518,10 +517,11 @@ mod tests {
             base_offset: OFFSET_SIZE,
             offsets: None,
         };
+        #[allow(clippy::single_range_in_vec_init)]
         let req = BatchRequest::new_with_follow_up(
             vec![0..OFFSET_SIZE],
             indirect_context,
-            |context, data| indirect_read_follow_up(context, data),
+            indirect_read_follow_up,
         );
         let data = file_scheduler.submit_request(req).await.unwrap();
 
@@ -544,10 +544,11 @@ mod tests {
                 base_offset: OFFSET_SIZE,
                 offsets: None,
             };
+            #[allow(clippy::single_range_in_vec_init)]
             let req = BatchRequest::new_with_follow_up(
                 vec![offset..offset + BATCH_SIZE + size_of::<u32>() as u64],
                 indirect_context,
-                |context, data| indirect_read_follow_up(context, data),
+                indirect_read_follow_up,
             );
             reqs.push_back(file_scheduler.submit_request(req));
             offset += BATCH_SIZE;
