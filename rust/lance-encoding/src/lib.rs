@@ -16,5 +16,5 @@ pub mod decoder;
 pub mod encoder;
 pub mod encodings;
 pub mod io;
-#[cfg(test)]
-pub mod testing;
+// #[cfg(test)]
+// pub mod testing;

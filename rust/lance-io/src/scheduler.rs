@@ -390,7 +390,7 @@ impl<'a> FileScheduler<'a> {
     pub fn submit_request<C: Send + 'static>(
         &self,
         request: BatchRequest<C>,
-    ) -> impl Future<Output = Result<LoadedBatch<C>>> + Send {
+    ) -> impl Future<Output = Result<LoadedBatch<C>>> + Send + 'static {
         self.root.submit_request(self.reader.clone(), request)
     }
 }

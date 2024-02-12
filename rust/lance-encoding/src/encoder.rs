@@ -1,7 +1,7 @@
 use arrow_array::ArrayRef;
 use arrow_buffer::Buffer;
 
-use lance_core::{Error, Result};
+use lance_core::Result;
 
 /// An encoded buffer
 pub struct EncodedBuffer {
