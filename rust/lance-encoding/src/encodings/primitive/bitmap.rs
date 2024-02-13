@@ -1,52 +1,71 @@
 use std::ops::Range;
 
-use arrow_array::{cast::AsArray, types::UInt32Type, ArrayRef, PrimitiveArray};
+use arrow_array::{cast::AsArray, ArrayRef};
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 
+use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 
 use crate::{
-    decoder::{DataDecoder, PageDecoder, Scheduled},
+    decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
     encoder::{ArrayEncoder, EncodedArray, EncodedBuffer},
-    io::BatchRequest,
+    io::FileScheduler2,
 };
 
+/// A physical scheduler for bitmap buffers encoded densely as 1 bit per value
+/// with bit-endianess (e.g. what Arrow uses for validity bitmaps and boolean arrays)
+///
+/// This decoder decodes from one buffer of disk data into one buffer of memory data
 #[derive(Debug, Clone, Copy)]
-struct BitmapDecoder {}
+struct DenseBitmapScheduler {}
 
-impl DataDecoder for BitmapDecoder {
-    fn update_capacity(
+impl PhysicalPageScheduler for DenseBitmapScheduler {
+    fn schedule_range(
         &self,
-        _data: &[Vec<Bytes>],
-        _rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
-    ) {
+        range: Range<u32>,
+        scheduler: &dyn FileScheduler2,
+    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+        debug_assert_ne!(range.start, range.end);
+        let start = range.start as u64 / 8;
+        let end = (range.end as u64 / 8) + 1;
+        let byte_range = start..end;
+
+        let bytes = scheduler.submit_request(vec![byte_range]);
+
+        async move {
+            let bytes = bytes.await?;
+            Ok(Box::new(BitmapDecoder { data: bytes }) as Box<dyn PhysicalPageDecoder>)
+        }
+        .boxed()
+    }
+}
+
+struct BitmapDecoder {
+    data: Vec<Bytes>,
+}
+
+impl PhysicalPageDecoder for BitmapDecoder {
+    fn update_capacity(&self, _rows_to_skip: u32, num_rows: u32, buffers: &mut [(u64, bool)]) {
         buffers[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
-        // This could be a validity buffer, if so, then it is needed since the writer
-        // went through the hassle of encoding it
-        buffers[0].1 = true;
+        // This decoder has no concept of "optional" buffers
     }
 
-    fn drain(
+    fn decode_into(
         &self,
-        data: &[Vec<Bytes>],
         rows_to_skip: u32,
-        // TODO: Review and remove these unused args
         num_rows: u32,
         dest_offset: u32,
         dest_buffers: &mut [BytesMut],
     ) {
         let mut bytes_to_fully_skip = rows_to_skip as u64 / 8;
         let mut bits_to_skip = rows_to_skip % 8;
-        let data_buf = &data[0];
 
         let mut dest_builder = BooleanBufferBuilder::new(num_rows as usize);
 
         let mut rows_remaining = num_rows;
-        for buf in data_buf {
+        for buf in &self.data {
             let buf_len = buf.len() as u64;
             if bytes_to_fully_skip > buf_len {
                 println!("Skipping entire page of {} bytes", buf_len);
@@ -85,44 +104,6 @@ impl DataDecoder for BitmapDecoder {
         // bytes of bool_buffer.as_slice will be 000XXXXX and if we copy it on top of YYY00000 then the YYY
         // will be clobbered.
         dest_buffers[0][dest_offset as usize..].copy_from_slice(bool_buffer.as_slice());
-    }
-}
-
-impl PageDecoder for BitmapDecoder {
-    fn num_buffers(&self) -> u32 {
-        1
-    }
-
-    fn schedule_range(&self, range: Range<u32>) -> Scheduled {
-        debug_assert_ne!(range.start, range.end);
-        let start = range.start as u64 / 8;
-        let end = (range.end as u64 / 8) + 1;
-        let byte_range = start..end;
-
-        let mut io_req = BatchRequest::new();
-        io_req.direct_read(byte_range);
-
-        Scheduled {
-            batch_requests: vec![io_req],
-            data_decoder: Box::new(*self),
-        }
-    }
-
-    fn schedule_take(&self, indices: PrimitiveArray<UInt32Type>) -> Scheduled {
-        let mut io_request = BatchRequest::new();
-        io_request.reserve_direct(indices.len() as u32);
-        for idx in indices.values().iter() {
-            let byte_idx = (*idx as u64) / 8;
-            io_request.direct_read(byte_idx..byte_idx + 1)
-        }
-
-        // TODO: We will definitely want coalescing in the I/O scheduler, some of these
-        // requests will be for the same byte
-
-        Scheduled {
-            batch_requests: vec![io_request],
-            data_decoder: Box::new(*self),
-        }
     }
 }
 
@@ -169,14 +150,17 @@ mod tests {
 
     use arrow_schema::{DataType, Field};
 
-    use crate::{encodings::basic::BasicDecoder, testing::check_round_trip_encoding};
+    use crate::encodings::primitive::{basic::BasicPageScheduler, bitmap::DenseBitmapScheduler};
+    use crate::testing::check_round_trip_encoding;
 
-    use super::{BitmapDecoder, BitmapEncoder};
+    use super::BitmapEncoder;
 
     #[tokio::test]
     async fn test_bitmap_boolean() {
         let encoder = BitmapEncoder {};
-        let decoder = Arc::new(BasicDecoder::new_non_nullable(Box::new(BitmapDecoder {})));
+        let decoder = Arc::new(BasicPageScheduler::new_non_nullable(Box::new(
+            DenseBitmapScheduler {},
+        )));
         let field = Field::new("", DataType::Boolean, false);
 
         check_round_trip_encoding(&encoder, decoder, field).await;

@@ -1,378 +1,293 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
-use arrow_array::{cast::AsArray, types::UInt32Type};
+use arrow_array::{
+    cast::AsArray,
+    types::{Int32Type, Int64Type, UInt32Type, UInt64Type},
+    ArrayRef, LargeListArray, ListArray,
+};
+use arrow_buffer::OffsetBuffer;
+use arrow_schema::{DataType, Field};
+use futures::{future::BoxFuture, FutureExt};
+use snafu::{location, Location};
+use tokio::task::JoinHandle;
 
-use lance_core::Result;
+use lance_core::{Error, Result};
 
-use crate::decoder::{LogicalPageScheduler, Scheduled2};
+use crate::decoder::{DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask};
 
-pub struct ListFieldScheduler {
-    indices_scheduler: Box<dyn LogicalPageScheduler>,
-    items_scheduler: Box<dyn LogicalPageScheduler>,
+/// A page scheduler for list fields that encodes offsets in one field and items in another
+///
+/// Offsets are encoded as u64.  This is neccesary beacuse a single page of list offsets could
+/// reference multiple pages of item data and thus these offsets can exceed the u32 range.  If
+/// this does happen then the list data type should be large list.
+///
+/// Encoding offsets as u64 does not impose much penalty for smaller lists.  The encoding used
+/// to store the u64 offsets should be doing some kind of bit-packing to ensure that the excess
+/// range does not incur an I/O penalty.  So for small list pages we are likely using considerably
+/// less than 32 bits per offset.
+///
+/// The list scheduler is somewhat unique because it requires indirect I/O.  We cannot know the
+/// ranges we need simply by looking at the metadata.  This means that list scheduling doesn't
+/// fit neatly into the two-thread schedule-loop / decode-loop model.  To handle this, when a
+/// list page is scheduled, we only schedule the I/O for the offsets and then we immediately
+/// launch a new thread task.  This new thread task waits for the offsets, decodes them, and then
+/// schedules the I/O for the items.  Keep in mind that list items can be lists themselves.  If
+/// that is the case then this indirection will continue.  The decode task that is returned will
+/// only finish `wait`ing when all of the I/O has completed.
+///
+/// Whenever we schedule follow-up I/O like this the priority is based on the top-level row
+/// index.  This helps ensure that earlier rows get finished completely (including follow up
+/// tasks) before we perform I/O for later rows.
+///
+/// Note: The length of the list page is 1 less than the legnth of the offsets page
+// TODO: Right now we are assuming that list offsets and list items are written at the same time.
+// As a result, we know which item pages correspond to which index page and there are no item
+// pages which overlap two different index pages.
+//
+// In the metadata for the page we store only the u64 num_items referenced by the page.
+//
+// We could relax this constraint.  Either each index page could store the u64 offset into
+// the total range of item pages or each index page could store a u64 num_items and a u32
+// first_item_page_offset.
+pub struct ListPageScheduler {
+    offsets_scheduler: Box<dyn LogicalPageScheduler>,
+    items_schedulers: Arc<Vec<Box<dyn LogicalPageScheduler>>>,
+    offset_type: DataType,
 }
 
-impl ListFieldScheduler {
+impl ListPageScheduler {
+    /// Create a new ListPageScheduler
+    ///
+    /// # Arguments
+    ///
+    /// * `offsets_scheduler` The scheduler to load the offsets, arrays should be u64
+    /// * `items_schedulers` The schedulers to load the items.  A list page will map
+    ///   to exactly one page of offsets but may contain more than one page of items
+    /// * `offset_type` The data type of the index.  This must either be Int32Type (in
+    ///   which case this will decode to ListType) or Int64Type (in which case this will
+    ///   decode to LargeListType).  Other types will result in an error.
     pub fn new(
-        indices_scheduler: Box<dyn LogicalPageScheduler>,
-        items_scheduler: Box<dyn LogicalPageScheduler>,
-    ) -> Self {
-        Self {
-            indices_scheduler,
-            items_scheduler,
+        offsets_scheduler: Box<dyn LogicalPageScheduler>,
+        items_schedulers: Vec<Box<dyn LogicalPageScheduler>>,
+        offset_type: DataType,
+    ) -> Result<Self> {
+        match &offset_type {
+            DataType::Int32 | DataType::Int64 => {}
+            _ => {
+                return Err(Error::InvalidInput {
+                    source: format!(
+                        "Provided list offset_type is {} which is not valid.  Must be i32 or i64",
+                        offset_type
+                    )
+                    .into(),
+                    location: location!(),
+                });
+            }
+        }
+        Ok(Self {
+            offsets_scheduler,
+            items_schedulers: Arc::new(items_schedulers),
+            offset_type,
+        })
+    }
+}
+
+impl LogicalPageScheduler for ListPageScheduler {
+    fn schedule_range(
+        &self,
+        range: std::ops::Range<u32>,
+        scheduler: &Arc<dyn crate::io::FileScheduler2>,
+    ) -> Result<Box<dyn LogicalPageDecoder>> {
+        let num_rows = range.end - range.start;
+        let num_offsets = num_rows + 1;
+        let offsets_range = range.start..(range.end + 1);
+        let mut scheduled_offsets = self
+            .offsets_scheduler
+            .schedule_range(offsets_range, scheduler)?;
+        let items_schedulers = self.items_schedulers.clone();
+        let scheduler = scheduler.clone();
+
+        // First we schedule, as normal, the I/O for the offsets.  Then we immediately spawn
+        // a task to decode those offsets and schedule the I/O for the items.  If we wait until
+        // the decode task has launched then we will be delaying the I/O for the items until we
+        // need them which is not good.  Better to spend some eager CPU and start loading the
+        // items immediately.
+        let indirect_fut = tokio::task::spawn(async move {
+            scheduled_offsets.wait().await?;
+            let decode_task = scheduled_offsets.drain(num_offsets)?;
+            let offsets = decode_task.task.decode()?;
+            let numeric_offsets = offsets.as_primitive::<UInt32Type>();
+            let start = numeric_offsets.values()[0];
+            let end = numeric_offsets.values()[numeric_offsets.len() - 1];
+
+            let mut rows_to_take = end - start;
+            let mut rows_to_skip = start;
+            let mut item_decoders = Vec::new();
+
+            for item_scheduler in items_schedulers.as_ref() {
+                if item_scheduler.num_rows() < rows_to_skip {
+                    rows_to_skip -= item_scheduler.num_rows()
+                } else {
+                    let rows_avail = item_scheduler.num_rows() - rows_to_skip;
+                    let to_take = rows_to_take.min(rows_avail);
+                    let page_range = rows_to_skip..(rows_to_skip + to_take);
+                    // Note that, if we have List<List<...>> then this call will schedule yet another round
+                    // of I/O :)
+                    item_decoders.push(item_scheduler.schedule_range(page_range, &scheduler)?);
+                    rows_to_skip = 0;
+                    rows_to_take -= to_take;
+                }
+            }
+
+            for item in &mut item_decoders {
+                // These waits could happen here or as part of ListPageDecoder::wait, it doesn't
+                // really matter.
+                item.wait().await?;
+            }
+            Ok(IndirectlyLoaded {
+                offsets,
+                item_decoders,
+            })
+        });
+        Ok(Box::new(ListPageDecoder {
+            offsets: None,
+            item_decoders: None,
+            num_rows,
+            rows_drained: 0,
+            unloaded: Some(indirect_fut),
+            offset_type: self.offset_type.clone(),
+        }))
+    }
+
+    // A list page's length is tied to the length of the offsets
+    fn num_rows(&self) -> u32 {
+        self.offsets_scheduler.num_rows() - 1
+    }
+}
+
+struct ListPageDecoder {
+    unloaded: Option<JoinHandle<Result<IndirectlyLoaded>>>,
+    // offsets will have already been decoded as part of the indirect I/O
+    offsets: Option<ArrayRef>,
+    // Items will not yet be decoded, we at least try and do that part
+    // on the decode thread
+    item_decoders: Option<VecDeque<Box<dyn LogicalPageDecoder>>>,
+    num_rows: u32,
+    rows_drained: u32,
+    offset_type: DataType,
+}
+
+struct ListDecodeTask {
+    offsets: ArrayRef,
+    items: Vec<Box<dyn DecodeArrayTask>>,
+    offset_type: DataType,
+}
+
+impl DecodeArrayTask for ListDecodeTask {
+    fn decode(self: Box<Self>) -> Result<ArrayRef> {
+        // The offsets are already decoded so all we are decoding at this point is the items
+        let offsets = self.offsets;
+        let items = self
+            .items
+            .into_iter()
+            .map(|task| task.decode())
+            .collect::<Result<Vec<_>>>()?;
+        let item_refs = items.iter().map(|item| item.as_ref()).collect::<Vec<_>>();
+        // TODO: could maybe try and "page bridge" these at some point
+        // (assuming item type is primitive) to avoid the concat
+        let items = arrow_select::concat::concat(&item_refs)?;
+        let nulls = offsets.nulls().cloned();
+        let item_field = Arc::new(Field::new(
+            "item",
+            items.data_type().clone(),
+            items.is_nullable(),
+        ));
+
+        match &self.offset_type {
+            DataType::Int32 => {
+                let offsets = arrow_cast::cast(&offsets, &DataType::Int32)?;
+                let offsets_i32 = offsets.as_primitive::<Int32Type>();
+                let offsets = OffsetBuffer::new(offsets_i32.values().clone());
+
+                Ok(Arc::new(ListArray::try_new(
+                    item_field, offsets, items, nulls,
+                )?))
+            }
+            DataType::Int64 => {
+                let offsets = arrow_cast::cast(&offsets, &DataType::Int64)?;
+                let offsets_i64 = offsets.as_primitive::<Int64Type>();
+                let offsets = OffsetBuffer::new(offsets_i64.values().clone());
+
+                Ok(Arc::new(LargeListArray::try_new(
+                    item_field, offsets, items, nulls,
+                )?))
+            }
+            _ => panic!("ListDecodeTask with data type that is not i32 or i64"),
         }
     }
 }
 
-impl LogicalPageScheduler for ListFieldScheduler {
-    fn schedule_next(
-        &mut self,
-        range: std::ops::Range<u64>,
-        scheduler: &Arc<dyn crate::io::FileScheduler2>,
-    ) -> Result<Scheduled2> {
-        let scheduled_indices = self.indices_scheduler.schedule_next(range, scheduler)?;
-        let num_rows = scheduled_indices.rows_taken;
-        let indirect_fut = tokio::task::spawn(async move {
-            scheduled_indices.decoder.wait().await?;
-            let decode_task = scheduled_indices.decoder.drain(num_rows)?;
-            let indices = decode_task.task.decode()?;
-            let numeric_indices = indices.as_primitive::<UInt32Type>();
-            let start = numeric_indices.values()[0];
-            let end = numeric_indices.values()[numeric_indices.len() - 1];
-            // Does this mean files are limited to 4Gi rows in any one column?  Seems reasonable.
-            let scheduled_items = self
-                .items_scheduler
-                .schedule_next(start as u64..end as u64, scheduler)?;
-            scheduled_items.decoder.wait().await
-        });
-        todo!()
+impl LogicalPageDecoder for ListPageDecoder {
+    fn wait<'a>(&'a mut self) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let indirectly_loaded = self.unloaded.take().unwrap().await.unwrap()?;
+            self.offsets = Some(indirectly_loaded.offsets);
+            self.item_decoders = Some(
+                indirectly_loaded
+                    .item_decoders
+                    .into_iter()
+                    .collect::<VecDeque<_>>(),
+            );
+            Ok(())
+        }
+        .boxed()
     }
 
-    fn schedule_all(
-        &mut self,
-        _range: std::ops::Range<u64>,
-        _scheduler: Arc<dyn crate::io::FileScheduler2>,
-    ) -> Result<Box<dyn crate::decoder::LogicalPageDecoder>> {
-        todo!()
+    fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask> {
+        // We already have the offsets but need to drain the item pages
+        let offsets = self
+            .offsets
+            .as_ref()
+            .unwrap()
+            .slice(self.rows_drained as usize, num_rows as usize + 1);
+        let offsets_u64 = offsets.as_primitive::<UInt64Type>();
+        let start = offsets_u64.values()[0];
+        let end = offsets_u64.values()[offsets_u64.len() - 1];
+        let mut num_items_to_drain = end - start;
+
+        let mut item_decodes = Vec::new();
+        let item_decoders = self.item_decoders.as_mut().unwrap();
+        while num_items_to_drain > 0 {
+            let next_item_page = item_decoders.front_mut().unwrap();
+            let avail = next_item_page.avail();
+            let to_take = num_items_to_drain.min(avail as u64) as u32;
+            num_items_to_drain -= to_take as u64;
+            let next_task = next_item_page.drain(to_take)?;
+
+            if !next_task.has_more {
+                item_decoders.pop_front();
+            }
+            item_decodes.push(next_task.task);
+        }
+
+        self.rows_drained += num_rows;
+        Ok(NextDecodeTask {
+            has_more: self.avail() > 0,
+            num_rows,
+            task: Box::new(ListDecodeTask {
+                offsets,
+                items: item_decodes,
+                offset_type: self.offset_type.clone(),
+            }) as Box<dyn DecodeArrayTask>,
+        })
+    }
+
+    fn avail(&self) -> u32 {
+        self.num_rows - self.rows_drained
     }
 }
 
-// struct PrimitiveFieldDecoder {
-//     data_type: DataType,
-//     unloaded_physical_decoder: Option<BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>>,
-//     physical_decoder: Option<Arc<dyn PhysicalPageDecoder>>,
-//     num_rows: u32,
-//     rows_drained: u32,
-// }
-
-// struct PrimitiveFieldDecodeTask {
-//     rows_to_skip: u32,
-//     rows_to_take: u32,
-//     physical_decoder: Arc<dyn PhysicalPageDecoder>,
-//     data_type: DataType,
-// }
-
-// impl DecodeArrayTask for PrimitiveFieldDecodeTask {
-//     fn decode(self: Box<Self>) -> Result<ArrayRef> {
-//         let mut capacities = [(0, false), (0, true)];
-//         self.physical_decoder.update_capacity(
-//             self.rows_to_skip,
-//             self.rows_to_take,
-//             &mut capacities,
-//         );
-//         let mut bufs = capacities
-//             .into_iter()
-//             .map(|(num_bytes, is_needed)| {
-//                 if is_needed {
-//                     BytesMut::with_capacity(num_bytes as usize)
-//                 } else {
-//                     BytesMut::default()
-//                 }
-//             })
-//             .collect::<Vec<_>>();
-
-//         self.physical_decoder
-//             .drain(self.rows_to_skip, self.rows_to_take, 0, &mut bufs);
-
-//         Self::primitive_array_from_buffers(&self.data_type, bufs, self.rows_to_take)
-//     }
-// }
-
-// impl PrimitiveFieldDecodeTask {
-//     fn new_primitive_array<T: ArrowPrimitiveType>(
-//         buffers: Vec<BytesMut>,
-//         num_rows: u32,
-//     ) -> ArrayRef {
-//         let mut buffer_iter = buffers.into_iter();
-//         let null_buffer = buffer_iter.next().unwrap();
-//         let null_buffer = if null_buffer.is_empty() {
-//             None
-//         } else {
-//             let null_buffer = null_buffer.freeze().into();
-//             Some(NullBuffer::new(BooleanBuffer::new(
-//                 Buffer::from_bytes(null_buffer),
-//                 0,
-//                 num_rows as usize,
-//             )))
-//         };
-
-//         let data_buffer = buffer_iter.next().unwrap().freeze();
-//         println!("Using data buffer: {:?}", data_buffer);
-//         let data_buffer = Buffer::from(data_buffer);
-//         let data_buffer = ScalarBuffer::<T::Native>::new(data_buffer, 0, num_rows as usize);
-
-//         Arc::new(PrimitiveArray::<T>::new(data_buffer, null_buffer))
-//     }
-
-//     fn primitive_array_from_buffers(
-//         data_type: &DataType,
-//         buffers: Vec<BytesMut>,
-//         num_rows: u32,
-//     ) -> Result<ArrayRef> {
-//         match data_type {
-//             DataType::Boolean => {
-//                 let mut buffer_iter = buffers.into_iter();
-//                 let null_buffer = buffer_iter.next().unwrap();
-//                 let null_buffer = if null_buffer.is_empty() {
-//                     None
-//                 } else {
-//                     let null_buffer = null_buffer.freeze().into();
-//                     Some(NullBuffer::new(BooleanBuffer::new(
-//                         Buffer::from_bytes(null_buffer),
-//                         0,
-//                         num_rows as usize,
-//                     )))
-//                 };
-
-//                 let data_buffer = buffer_iter.next().unwrap().freeze();
-//                 let data_buffer = Buffer::from(data_buffer);
-//                 let data_buffer = BooleanBuffer::new(data_buffer, 0, num_rows as usize);
-
-//                 Ok(Arc::new(BooleanArray::new(data_buffer, null_buffer)))
-//             }
-//             DataType::Date32 => Ok(Self::new_primitive_array::<Date32Type>(buffers, num_rows)),
-//             DataType::Date64 => Ok(Self::new_primitive_array::<Date64Type>(buffers, num_rows)),
-//             DataType::Decimal128(_, _) => Ok(Self::new_primitive_array::<Decimal128Type>(
-//                 buffers, num_rows,
-//             )),
-//             DataType::Decimal256(_, _) => Ok(Self::new_primitive_array::<Decimal256Type>(
-//                 buffers, num_rows,
-//             )),
-//             DataType::Duration(units) => Ok(match units {
-//                 TimeUnit::Second => {
-//                     Self::new_primitive_array::<DurationSecondType>(buffers, num_rows)
-//                 }
-//                 TimeUnit::Microsecond => {
-//                     Self::new_primitive_array::<DurationMicrosecondType>(buffers, num_rows)
-//                 }
-//                 TimeUnit::Millisecond => {
-//                     Self::new_primitive_array::<DurationMillisecondType>(buffers, num_rows)
-//                 }
-//                 TimeUnit::Nanosecond => {
-//                     Self::new_primitive_array::<DurationNanosecondType>(buffers, num_rows)
-//                 }
-//             }),
-//             DataType::Float16 => Ok(Self::new_primitive_array::<Float16Type>(buffers, num_rows)),
-//             DataType::Float32 => Ok(Self::new_primitive_array::<Float32Type>(buffers, num_rows)),
-//             DataType::Float64 => Ok(Self::new_primitive_array::<Float64Type>(buffers, num_rows)),
-//             DataType::Int16 => Ok(Self::new_primitive_array::<Int16Type>(buffers, num_rows)),
-//             DataType::Int32 => Ok(Self::new_primitive_array::<Int32Type>(buffers, num_rows)),
-//             DataType::Int64 => Ok(Self::new_primitive_array::<Int64Type>(buffers, num_rows)),
-//             DataType::Int8 => Ok(Self::new_primitive_array::<Int8Type>(buffers, num_rows)),
-//             DataType::Interval(unit) => Ok(match unit {
-//                 IntervalUnit::DayTime => {
-//                     Self::new_primitive_array::<IntervalDayTimeType>(buffers, num_rows)
-//                 }
-//                 IntervalUnit::MonthDayNano => {
-//                     Self::new_primitive_array::<IntervalMonthDayNanoType>(buffers, num_rows)
-//                 }
-//                 IntervalUnit::YearMonth => {
-//                     Self::new_primitive_array::<IntervalYearMonthType>(buffers, num_rows)
-//                 }
-//             }),
-//             DataType::Null => Ok(new_null_array(data_type, num_rows as usize)),
-//             DataType::Time32(unit) => match unit {
-//                 TimeUnit::Millisecond => Ok(Self::new_primitive_array::<Time32MillisecondType>(
-//                     buffers, num_rows,
-//                 )),
-//                 TimeUnit::Second => Ok(Self::new_primitive_array::<Time32SecondType>(
-//                     buffers, num_rows,
-//                 )),
-//                 _ => Err(Error::IO {
-//                     message: format!("invalid time unit {:?} for 32-bit time type", unit),
-//                     location: location!(),
-//                 }),
-//             },
-//             DataType::Time64(unit) => match unit {
-//                 TimeUnit::Microsecond => Ok(Self::new_primitive_array::<Time64MicrosecondType>(
-//                     buffers, num_rows,
-//                 )),
-//                 TimeUnit::Nanosecond => Ok(Self::new_primitive_array::<Time64NanosecondType>(
-//                     buffers, num_rows,
-//                 )),
-//                 _ => Err(Error::IO {
-//                     message: format!("invalid time unit {:?} for 64-bit time type", unit),
-//                     location: location!(),
-//                 }),
-//             },
-//             DataType::Timestamp(unit, _) => Ok(match unit {
-//                 TimeUnit::Microsecond => {
-//                     Self::new_primitive_array::<TimestampMicrosecondType>(buffers, num_rows)
-//                 }
-//                 TimeUnit::Millisecond => {
-//                     Self::new_primitive_array::<TimestampMillisecondType>(buffers, num_rows)
-//                 }
-//                 TimeUnit::Nanosecond => {
-//                     Self::new_primitive_array::<TimestampNanosecondType>(buffers, num_rows)
-//                 }
-//                 TimeUnit::Second => {
-//                     Self::new_primitive_array::<TimestampSecondType>(buffers, num_rows)
-//                 }
-//             }),
-//             DataType::UInt16 => Ok(Self::new_primitive_array::<UInt16Type>(buffers, num_rows)),
-//             DataType::UInt32 => Ok(Self::new_primitive_array::<UInt32Type>(buffers, num_rows)),
-//             DataType::UInt64 => Ok(Self::new_primitive_array::<UInt64Type>(buffers, num_rows)),
-//             DataType::UInt8 => Ok(Self::new_primitive_array::<UInt8Type>(buffers, num_rows)),
-//             _ => Err(Error::IO {
-//                 message: format!(
-//                     "The data type {} cannot be decoded from a primitive encoding",
-//                     data_type
-//                 ),
-//                 location: location!(),
-//             }),
-//         }
-//     }
-// }
-
-// impl LogicalPageDecoder for PrimitiveFieldDecoder {
-//     fn wait<'a>(&'a mut self) -> BoxFuture<'a, Result<()>> {
-//         async move {
-//             let physical_decoder = self.unloaded_physical_decoder.take().unwrap().await?;
-//             self.physical_decoder = Some(Arc::from(physical_decoder));
-//             Ok(())
-//         }
-//         .boxed()
-//     }
-
-//     fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask> {
-//         let rows_to_skip = self.rows_drained;
-//         let rows_to_take = num_rows - rows_to_skip;
-
-//         self.rows_drained += rows_to_take;
-
-//         let task = Box::new(PrimitiveFieldDecodeTask {
-//             rows_to_skip,
-//             rows_to_take,
-//             physical_decoder: self.physical_decoder.as_ref().unwrap().clone(),
-//             data_type: self.data_type.clone(),
-//         });
-
-//         Ok(NextDecodeTask {
-//             task,
-//             num_rows: rows_to_take,
-//             has_more: self.rows_drained != self.num_rows,
-//         })
-//     }
-// }
-
-// impl<S: FileScheduler> FieldDecoder<S> for PrimitiveFieldScheduler<S> {
-//     fn schedule_next_range(&mut self, range: Range<u64>, scheduler: &S) -> Result<u64> {
-//         let mut next_page = &self.column.page_infos[self.scheduled_pages as usize];
-//         let num_rows_desired = range.end - range.start;
-
-//         // First, skip any entirely skipped pages
-//         let mut rows_to_skip = range.start;
-//         while (next_page.num_rows as u64) < rows_to_skip {
-//             self.scheduled_pages += 1;
-//             rows_to_skip -= next_page.num_rows as u64;
-//             next_page = &self.column.page_infos[self.scheduled_pages as usize];
-//         }
-
-//         // Now we have page that overlaps our range somewhat.  Figure out how many
-//         // rows we can take
-//         let rows_available = next_page.num_rows as u64 - rows_to_skip;
-//         let rows_to_take = rows_available.min(num_rows_desired) as u32;
-
-//         let page_start = rows_to_skip as u32;
-//         let page_end = page_start + rows_to_take;
-
-//         let data_decoder = next_page
-//             .decoder
-//             .schedule_range(page_start..page_end, scheduler);
-//         self.drainable_chunks.push_back(DrainableChunk {
-//             decoder: data_decoder,
-//             num_rows: rows_to_take,
-//             rows_drained: 0,
-//             loaded: false,
-//         });
-
-//         self.scheduled_pages += 1;
-
-//         Ok(range.start + rows_to_take as u64)
-//     }
-
-//     async fn wait_for_rows(&mut self, num_rows: u32) -> Result<()> {
-//         let mut rows_to_wait = num_rows;
-//         let mut drainable_chunks_iter = self.drainable_chunks.iter_mut();
-//         while rows_to_wait > 0 {
-//             let next = drainable_chunks_iter.next().unwrap();
-//             if !next.loaded {
-//                 next.decoder.load().await?;
-//             }
-//             rows_to_wait -= next.rows_available();
-//         }
-//         Ok(())
-//     }
-
-//     fn drain(&mut self, num_rows: u32) -> Result<ArrayRef> {
-//         let mut chunks_to_drain = Vec::new();
-//         let mut drained_chunks = Vec::new();
-
-//         let mut rows_to_drain = num_rows;
-
-//         while self.drainable_chunks.front().unwrap().rows_available() < rows_to_drain {
-//             let next_chunk = self.drainable_chunks.pop_front().unwrap();
-//             rows_to_drain -= next_chunk.rows_available();
-//             drained_chunks.push(next_chunk);
-//         }
-
-//         chunks_to_drain.extend(
-//             drained_chunks
-//                 .iter()
-//                 .map(|chunk| (chunk, chunk.rows_drained, chunk.rows_available())),
-//         );
-
-//         if rows_to_drain > 0 {
-//             let last_chunk = self.drainable_chunks.front_mut().unwrap();
-//             let rows_to_skip = last_chunk.rows_drained;
-//             last_chunk.rows_drained += rows_to_drain;
-//             chunks_to_drain.push((last_chunk, rows_to_skip, rows_to_drain));
-//         }
-
-//         let mut capacities = [(0, false), (0, true)];
-//         for (chunk, rows_to_skip, num_rows) in chunks_to_drain.iter() {
-//             chunk
-//                 .decoder
-//                 .update_capacity(*rows_to_skip, *num_rows, &mut capacities)
-//         }
-//         let mut bufs = capacities
-//             .into_iter()
-//             .map(|(num_bytes, is_needed)| {
-//                 if is_needed {
-//                     BytesMut::with_capacity(num_bytes as usize)
-//                 } else {
-//                     BytesMut::default()
-//                 }
-//             })
-//             .collect::<Vec<_>>();
-
-//         let mut dest_offset = 0;
-//         for (chunk, rows_to_skip, num_rows) in chunks_to_drain {
-//             chunk
-//                 .decoder
-//                 .drain(rows_to_skip, num_rows, dest_offset, &mut bufs);
-//             dest_offset += num_rows;
-//         }
-
-//         Self::primitive_array_from_buffers(&self.data_type, bufs, num_rows)
-//     }
-// }
+struct IndirectlyLoaded {
+    offsets: ArrayRef,
+    item_decoders: Vec<Box<dyn LogicalPageDecoder>>,
+}

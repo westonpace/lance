@@ -26,18 +26,32 @@ use crate::decoder::{
     PhysicalPageDecoder,
 };
 
-pub struct PrimitiveFieldScheduler {
+/// A page schedule for primitive fields
+///
+/// This maps to exactly one physical page and it assumes that the top-level
+/// encoding of the page is "basic".  The basic encoding decodes into an
+/// optional buffer of validity and a fixed-width buffer of values
+/// which is exactly what we need to create a primitive array.
+pub struct PrimitivePageScheduler {
     data_type: DataType,
     page: Arc<PageInfo2>,
 }
 
-impl PrimitiveFieldScheduler {
+impl PrimitivePageScheduler {
+    /// Create a new instance
+    ///
+    /// # Arguments
+    ///
+    /// * `data_type` - The Arrow type of the field.  This must be a primitive data type.
+    ///   (although our definition of primitive here includes boolean and fixed size list
+    ///   which is slightly different than arrow-rs' definition)
+    /// * `page` - The physical page info
     pub fn new(data_type: DataType, page: Arc<PageInfo2>) -> Self {
         Self { data_type, page }
     }
 }
 
-impl LogicalPageScheduler for PrimitiveFieldScheduler {
+impl LogicalPageScheduler for PrimitivePageScheduler {
     fn num_rows(&self) -> u32 {
         self.page.num_rows
     }
@@ -47,8 +61,8 @@ impl LogicalPageScheduler for PrimitiveFieldScheduler {
         range: std::ops::Range<u32>,
         scheduler: &Arc<dyn crate::io::FileScheduler2>,
     ) -> Result<Box<dyn LogicalPageDecoder>> {
-        let physical_decoder = self.page.decoder.schedule_range(range, scheduler.as_ref());
         let num_rows = range.end - range.start;
+        let physical_decoder = self.page.decoder.schedule_range(range, scheduler.as_ref());
 
         let logical_decoder = PrimitiveFieldDecoder {
             data_type: self.data_type.clone(),
@@ -79,15 +93,20 @@ struct PrimitiveFieldDecodeTask {
 
 impl DecodeArrayTask for PrimitiveFieldDecodeTask {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
+        // There are two buffers, the validity buffer and the values buffer
+        // We start by assuming the validity buffer will not be required
         let mut capacities = [(0, false), (0, true)];
         self.physical_decoder.update_capacity(
             self.rows_to_skip,
             self.rows_to_take,
             &mut capacities,
         );
+        // At this point we know the size needed for each buffer
         let mut bufs = capacities
             .into_iter()
             .map(|(num_bytes, is_needed)| {
+                // Only allocate the validity buffer if it is needed, otherwise we
+                // create an empty BytesMut (does not require allocation)
                 if is_needed {
                     BytesMut::with_capacity(num_bytes as usize)
                 } else {
@@ -96,14 +115,19 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
             })
             .collect::<Vec<_>>();
 
+        // Go ahead and fill the validity / values buffers
         self.physical_decoder
-            .drain(self.rows_to_skip, self.rows_to_take, 0, &mut bufs);
+            .decode_into(self.rows_to_skip, self.rows_to_take, 0, &mut bufs);
 
+        // Convert the two buffers into an Arrow array
         Self::primitive_array_from_buffers(&self.data_type, bufs, self.rows_to_take)
     }
 }
 
 impl PrimitiveFieldDecodeTask {
+    // TODO: Does this capability exist upstream somewhere?  I couldn't find
+    // it from a simple scan but it seems the ability to convert two buffers
+    // into a primitive array is pretty fundamental.
     fn new_primitive_array<T: ArrowPrimitiveType>(
         buffers: Vec<BytesMut>,
         num_rows: u32,
@@ -251,6 +275,7 @@ impl PrimitiveFieldDecodeTask {
 
 impl LogicalPageDecoder for PrimitiveFieldDecoder {
     fn wait<'a>(&'a mut self) -> BoxFuture<'a, Result<()>> {
+        println!("WAIT");
         async move {
             let physical_decoder = self.unloaded_physical_decoder.take().unwrap().await?;
             self.physical_decoder = Some(Arc::from(physical_decoder));
@@ -260,8 +285,9 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
     }
 
     fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask> {
+        println!("DRAIN");
         let rows_to_skip = self.rows_drained;
-        let rows_to_take = num_rows - rows_to_skip;
+        let rows_to_take = num_rows;
 
         self.rows_drained += rows_to_take;
 
@@ -272,113 +298,18 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
             data_type: self.data_type.clone(),
         });
 
+        println!(
+            "drained: rows_drained={} num_rows={}",
+            self.rows_drained, self.num_rows
+        );
         Ok(NextDecodeTask {
             task,
             num_rows: rows_to_take,
             has_more: self.rows_drained != self.num_rows,
         })
     }
+
+    fn avail(&self) -> u32 {
+        self.num_rows - self.rows_drained
+    }
 }
-
-// impl<S: FileScheduler> FieldDecoder<S> for PrimitiveFieldScheduler<S> {
-//     fn schedule_next_range(&mut self, range: Range<u64>, scheduler: &S) -> Result<u64> {
-//         let mut next_page = &self.column.page_infos[self.scheduled_pages as usize];
-//         let num_rows_desired = range.end - range.start;
-
-//         // First, skip any entirely skipped pages
-//         let mut rows_to_skip = range.start;
-//         while (next_page.num_rows as u64) < rows_to_skip {
-//             self.scheduled_pages += 1;
-//             rows_to_skip -= next_page.num_rows as u64;
-//             next_page = &self.column.page_infos[self.scheduled_pages as usize];
-//         }
-
-//         // Now we have page that overlaps our range somewhat.  Figure out how many
-//         // rows we can take
-//         let rows_available = next_page.num_rows as u64 - rows_to_skip;
-//         let rows_to_take = rows_available.min(num_rows_desired) as u32;
-
-//         let page_start = rows_to_skip as u32;
-//         let page_end = page_start + rows_to_take;
-
-//         let data_decoder = next_page
-//             .decoder
-//             .schedule_range(page_start..page_end, scheduler);
-//         self.drainable_chunks.push_back(DrainableChunk {
-//             decoder: data_decoder,
-//             num_rows: rows_to_take,
-//             rows_drained: 0,
-//             loaded: false,
-//         });
-
-//         self.scheduled_pages += 1;
-
-//         Ok(range.start + rows_to_take as u64)
-//     }
-
-//     async fn wait_for_rows(&mut self, num_rows: u32) -> Result<()> {
-//         let mut rows_to_wait = num_rows;
-//         let mut drainable_chunks_iter = self.drainable_chunks.iter_mut();
-//         while rows_to_wait > 0 {
-//             let next = drainable_chunks_iter.next().unwrap();
-//             if !next.loaded {
-//                 next.decoder.load().await?;
-//             }
-//             rows_to_wait -= next.rows_available();
-//         }
-//         Ok(())
-//     }
-
-//     fn drain(&mut self, num_rows: u32) -> Result<ArrayRef> {
-//         let mut chunks_to_drain = Vec::new();
-//         let mut drained_chunks = Vec::new();
-
-//         let mut rows_to_drain = num_rows;
-
-//         while self.drainable_chunks.front().unwrap().rows_available() < rows_to_drain {
-//             let next_chunk = self.drainable_chunks.pop_front().unwrap();
-//             rows_to_drain -= next_chunk.rows_available();
-//             drained_chunks.push(next_chunk);
-//         }
-
-//         chunks_to_drain.extend(
-//             drained_chunks
-//                 .iter()
-//                 .map(|chunk| (chunk, chunk.rows_drained, chunk.rows_available())),
-//         );
-
-//         if rows_to_drain > 0 {
-//             let last_chunk = self.drainable_chunks.front_mut().unwrap();
-//             let rows_to_skip = last_chunk.rows_drained;
-//             last_chunk.rows_drained += rows_to_drain;
-//             chunks_to_drain.push((last_chunk, rows_to_skip, rows_to_drain));
-//         }
-
-//         let mut capacities = [(0, false), (0, true)];
-//         for (chunk, rows_to_skip, num_rows) in chunks_to_drain.iter() {
-//             chunk
-//                 .decoder
-//                 .update_capacity(*rows_to_skip, *num_rows, &mut capacities)
-//         }
-//         let mut bufs = capacities
-//             .into_iter()
-//             .map(|(num_bytes, is_needed)| {
-//                 if is_needed {
-//                     BytesMut::with_capacity(num_bytes as usize)
-//                 } else {
-//                     BytesMut::default()
-//                 }
-//             })
-//             .collect::<Vec<_>>();
-
-//         let mut dest_offset = 0;
-//         for (chunk, rows_to_skip, num_rows) in chunks_to_drain {
-//             chunk
-//                 .decoder
-//                 .drain(rows_to_skip, num_rows, dest_offset, &mut bufs);
-//             dest_offset += num_rows;
-//         }
-
-//         Self::primitive_array_from_buffers(&self.data_type, bufs, num_rows)
-//     }
-// }

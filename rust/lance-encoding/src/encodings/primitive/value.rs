@@ -8,23 +8,61 @@ use crate::{
 
 use lance_core::Result;
 
+/// Scheduler for a simple encoding where buffers of fixed-size items are stored as-is on disk
 #[derive(Debug, Clone, Copy)]
-struct ValueDecoder {
+struct ValuePageScheduler {
+    // TODO: do we really support values greater than 2^32 bytes per value?
+    // I think we want to, in theory, but should probably test this case.
     bytes_per_value: u64,
 }
 
-struct ValueDataDecoder2 {
+impl ValuePageScheduler {
+    /// Create a new instance
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes_per_value` - the size, in bytes, of each item
+    pub fn new(bytes_per_value: u64) -> Self {
+        Self { bytes_per_value }
+    }
+}
+
+impl PhysicalPageScheduler for ValuePageScheduler {
+    fn schedule_range(
+        &self,
+        range: std::ops::Range<u32>,
+        scheduler: &dyn FileScheduler2,
+    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+        let start = range.start as u64 * self.bytes_per_value;
+        let end = range.end as u64 * self.bytes_per_value;
+        let byte_range = start..end;
+
+        let bytes = scheduler.submit_request(vec![byte_range]);
+        let bytes_per_value = self.bytes_per_value;
+
+        async move {
+            let bytes = bytes.await?;
+            Ok(Box::new(ValuePageDecoder {
+                bytes_per_value: bytes_per_value,
+                data: bytes,
+            }) as Box<dyn PhysicalPageDecoder>)
+        }
+        .boxed()
+    }
+}
+
+struct ValuePageDecoder {
     bytes_per_value: u64,
     data: Vec<Bytes>,
 }
 
-impl PhysicalPageDecoder for ValueDataDecoder2 {
+impl PhysicalPageDecoder for ValuePageDecoder {
     fn update_capacity(&self, _rows_to_skip: u32, num_rows: u32, buffers: &mut [(u64, bool)]) {
         buffers[0].0 = self.bytes_per_value * num_rows as u64;
         buffers[0].1 = true;
     }
 
-    fn drain(
+    fn decode_into(
         &self,
         rows_to_skip: u32,
         num_rows: u32,
@@ -52,29 +90,5 @@ impl PhysicalPageDecoder for ValueDataDecoder2 {
                 bytes_to_skip = 0;
             }
         }
-    }
-}
-
-impl PhysicalPageScheduler for ValueDecoder {
-    fn schedule_range(
-        &self,
-        range: std::ops::Range<u32>,
-        scheduler: &dyn FileScheduler2,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
-        let start = range.start as u64 * self.bytes_per_value;
-        let end = range.end as u64 * self.bytes_per_value;
-        let byte_range = start..end;
-
-        let bytes = scheduler.submit_request(vec![byte_range]);
-        let bytes_per_value = self.bytes_per_value;
-
-        async move {
-            let bytes = bytes.await?;
-            Ok(Box::new(ValueDataDecoder2 {
-                bytes_per_value: bytes_per_value,
-                data: bytes,
-            }) as Box<dyn PhysicalPageDecoder>)
-        }
-        .boxed()
     }
 }

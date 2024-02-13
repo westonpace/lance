@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::{collections::VecDeque, ops::Range, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -11,10 +11,8 @@ use lance_core::Result;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::{
-    encodings::logical::{self, primitive::PrimitiveFieldScheduler},
-    io::FileScheduler2,
-};
+use crate::encodings::logical::primitive::PrimitivePageScheduler;
+use crate::io::FileScheduler2;
 
 pub trait DataDecoder: Send {
     fn load<'a>(&'a mut self) -> BoxFuture<'a, Result<()>>;
@@ -47,6 +45,25 @@ impl ColumnInfo2 {
 
 pub struct BatchScheduler {
     field_schedulers: Vec<Vec<Box<dyn LogicalPageScheduler>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FieldWalkStatus {
+    rows_to_skip: u64,
+    rows_to_take: u64,
+    page_offset: u32,
+    rows_queued: u64,
+}
+
+impl FieldWalkStatus {
+    fn new_from_range(range: Range<u64>) -> Self {
+        Self {
+            rows_to_skip: range.start,
+            rows_to_take: range.end - range.start,
+            page_offset: 0,
+            rows_queued: 0,
+        }
+    }
 }
 
 impl BatchScheduler {
@@ -85,7 +102,7 @@ impl BatchScheduler {
                     .iter()
                     .cloned()
                     .map(|page_info| {
-                        Box::new(PrimitiveFieldScheduler::new(
+                        Box::new(PrimitivePageScheduler::new(
                             field.data_type().clone(),
                             page_info,
                         )) as Box<dyn LogicalPageScheduler>
@@ -110,27 +127,41 @@ impl BatchScheduler {
         &mut self,
         range: Range<u64>,
         sink: mpsc::Sender<Box<dyn LogicalPageDecoder>>,
-        scheduler: Arc<dyn FileScheduler2>,
+        scheduler: &Arc<dyn FileScheduler2>,
     ) -> Result<()> {
         let mut rows_to_read = range.end - range.start;
 
-        let mut field_ranges = vec![range.clone(); self.field_schedulers.len()];
-        let mut rows_queued = vec![0_u32; self.field_schedulers.len()];
+        let mut field_status =
+            vec![FieldWalkStatus::new_from_range(range); self.field_schedulers.len()];
 
         while rows_to_read > 0 {
             let mut min_rows_added = u32::MAX;
-            for (col_idx, field_scheduler) in self.field_schedulers.iter_mut().enumerate() {
-                if rows_queued[col_idx] == 0 {
-                    let remaining_range = field_ranges[col_idx].clone();
-                    let scheduled = field_scheduler.schedule_next(remaining_range, &scheduler)?;
+            for (col_idx, field_scheduler) in self.field_schedulers.iter().enumerate() {
+                let status = &mut field_status[col_idx];
+                if status.rows_queued == 0 {
+                    let mut next_page = &field_scheduler[status.page_offset as usize];
 
-                    let updated_range = (range.start + (scheduled.rows_taken as u64))..range.end;
-                    field_ranges[col_idx] = updated_range;
+                    while status.rows_to_skip > next_page.num_rows() as u64 {
+                        status.rows_to_skip -= next_page.num_rows() as u64;
+                        status.page_offset += 1;
+                        next_page = &field_scheduler[status.page_offset as usize];
+                    }
 
-                    sink.send(scheduled.decoder).await.unwrap();
+                    let page_range_start = status.rows_to_skip as u32;
+                    let page_rows_remaining = next_page.num_rows() - page_range_start;
+                    let rows_to_take = status.rows_to_take.min(page_rows_remaining as u64) as u32;
+                    let page_range = page_range_start..(page_range_start + rows_to_take);
 
-                    min_rows_added = min_rows_added.min(scheduled.rows_taken);
-                    rows_queued[col_idx] = scheduled.rows_taken;
+                    let scheduled = next_page.schedule_range(page_range, &scheduler)?;
+
+                    status.rows_queued += rows_to_take as u64;
+                    status.rows_to_take -= rows_to_take as u64;
+                    status.page_offset += 1;
+                    status.rows_to_skip = 0;
+
+                    sink.send(scheduled).await.unwrap();
+
+                    min_rows_added = min_rows_added.min(rows_to_take);
                 }
             }
             if min_rows_added == 0 {
@@ -138,7 +169,7 @@ impl BatchScheduler {
             }
             rows_to_read -= min_rows_added as u64;
             for col_idx in 0..self.field_schedulers.len() {
-                rows_queued[col_idx] -= min_rows_added;
+                field_status[col_idx].rows_queued -= min_rows_added as u64;
             }
         }
         Ok(())
@@ -178,7 +209,7 @@ struct PartiallyDecodedPage {
 
 pub struct BatchDecodeStream {
     scheduled: mpsc::Receiver<Box<dyn LogicalPageDecoder>>,
-    partial_pages: Vec<PartiallyDecodedPage>,
+    partial_pages: VecDeque<PartiallyDecodedPage>,
     schema: Schema,
     rows_remaining: u64,
     rows_per_batch: u32,
@@ -186,31 +217,61 @@ pub struct BatchDecodeStream {
 }
 
 impl BatchDecodeStream {
+    pub fn new(
+        scheduled: mpsc::Receiver<Box<dyn LogicalPageDecoder>>,
+        schema: Schema,
+        rows_per_batch: u32,
+        num_rows: u64,
+        num_columns: u32,
+    ) -> Self {
+        Self {
+            scheduled,
+            partial_pages: VecDeque::new(),
+            schema,
+            rows_remaining: num_rows,
+            rows_per_batch,
+            num_columns,
+        }
+    }
+
     async fn next_batch_task(&mut self) -> Result<Option<DecodeBatchTask>> {
         if self.rows_remaining == 0 {
             return Ok(None);
         }
 
-        let mut pages = Vec::new();
-        std::mem::swap(&mut pages, &mut self.partial_pages);
-        let mut page_iter = pages.into_iter().peekable();
         let mut batch_steps = Vec::new();
         let rows_in_batch = (self.rows_per_batch as u64).min(self.rows_remaining) as u32;
+        println!(
+            "next_batch_task self.rows_remaining={} rows_in_batch={}",
+            self.rows_remaining, rows_in_batch
+        );
         self.rows_remaining -= rows_in_batch as u64;
 
         for col_idx in 0..self.num_columns {
             let mut col_steps = Vec::new();
             let mut rows_remaining = rows_in_batch;
             while rows_remaining > 0 {
-                let mut next_page_for_field = if page_iter
-                    .peek()
+                println!("Looking for col_idx {}", col_idx);
+                println!(
+                    "Next partial is {}",
+                    self.partial_pages
+                        .front()
+                        .map(|partial_page| partial_page.col_index)
+                        .unwrap_or(u32::MAX)
+                );
+                let mut next_page_for_field = if self
+                    .partial_pages
+                    .front()
                     .map(|partial_page| partial_page.col_index)
                     .unwrap_or(u32::MAX)
                     == col_idx
                 {
-                    page_iter.next().unwrap()
+                    println!("Take partially decoded");
+                    self.partial_pages.pop_front().unwrap()
                 } else {
-                    let decoder = self.scheduled.recv().await.unwrap();
+                    println!("Take new item from stream");
+                    let mut decoder = self.scheduled.recv().await.unwrap();
+                    decoder.wait().await?;
                     PartiallyDecodedPage {
                         col_index: col_idx,
                         decoder,
@@ -219,8 +280,13 @@ impl BatchDecodeStream {
                 let next_step = next_page_for_field.decoder.drain(rows_remaining)?;
                 rows_remaining -= next_step.num_rows;
                 col_steps.push(next_step.task);
+                println!(
+                    "next_step has_more={} rows_remaining={}",
+                    next_step.has_more, rows_remaining
+                );
                 if next_step.has_more {
-                    self.partial_pages.push(next_page_for_field);
+                    println!("push front");
+                    self.partial_pages.push_front(next_page_for_field);
                 }
             }
             batch_steps.push(col_steps);
@@ -248,7 +314,7 @@ impl BatchDecodeStream {
 
 pub trait PhysicalPageDecoder: Send + Sync {
     fn update_capacity(&self, rows_to_skip: u32, num_rows: u32, buffers: &mut [(u64, bool)]);
-    fn drain(
+    fn decode_into(
         &self,
         // TODO: Coalesce on read and change this to &[Bytes]
         rows_to_skip: u32,
@@ -288,4 +354,5 @@ pub struct NextDecodeTask {
 pub trait LogicalPageDecoder: Send {
     fn wait<'a>(&'a mut self) -> BoxFuture<'a, Result<()>>;
     fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask>;
+    fn avail(&self) -> u32;
 }
