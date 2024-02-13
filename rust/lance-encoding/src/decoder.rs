@@ -113,6 +113,15 @@ impl FieldWalkStatus {
 }
 
 impl DecodeBatchScheduler {
+    // This function is where the all important mapping from Arrow schema
+    // to expected decoders happens.  Decoders are created by using the
+    // expected field and the encoding metadata in the page.
+    //
+    // For example, if a field is a struct field then we expect a header
+    // column that could have one of a few different encodings.
+    //
+    // If the encoding for a page is "shredded" then the header column will
+    // contain a validity bitmap and the
     fn create_field_scheduler<'a>(
         field: &Field,
         column_infos: &mut impl Iterator<Item = &'a Arc<ColumnInfo>>,
