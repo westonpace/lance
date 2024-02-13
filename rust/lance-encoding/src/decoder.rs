@@ -11,7 +11,10 @@ use lance_core::Result;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::{encodings::logical, io::FileScheduler2};
+use crate::{
+    encodings::logical::{self, primitive::PrimitiveFieldScheduler},
+    io::FileScheduler2,
+};
 
 pub trait DataDecoder: Send {
     fn load<'a>(&'a mut self) -> BoxFuture<'a, Result<()>>;
@@ -33,24 +36,24 @@ pub struct PageInfo2 {
 }
 
 pub struct ColumnInfo2 {
-    pub page_infos: Vec<PageInfo2>,
+    pub page_infos: Vec<Arc<PageInfo2>>,
 }
 
 impl ColumnInfo2 {
-    pub fn new(page_infos: Vec<PageInfo2>) -> Self {
+    pub fn new(page_infos: Vec<Arc<PageInfo2>>) -> Self {
         Self { page_infos }
     }
 }
 
 pub struct BatchScheduler {
-    field_schedulers: Vec<Box<dyn LogicalPageScheduler>>,
+    field_schedulers: Vec<Vec<Box<dyn LogicalPageScheduler>>>,
 }
 
 impl BatchScheduler {
     fn create_field_scheduler<'a>(
         field: &Field,
         column_infos: &mut impl Iterator<Item = &'a Arc<ColumnInfo2>>,
-    ) -> Box<dyn LogicalPageScheduler> {
+    ) -> Vec<Box<dyn LogicalPageScheduler>> {
         match field.data_type() {
             DataType::Boolean
             | DataType::Date32
@@ -74,10 +77,21 @@ impl BatchScheduler {
             | DataType::UInt16
             | DataType::UInt32
             | DataType::UInt64
-            | DataType::UInt8 => Box::new(logical::primitive::PrimitiveFieldScheduler::new(
-                field.data_type().clone(),
-                column_infos.next().unwrap().clone(),
-            )),
+            | DataType::UInt8 => {
+                // Primitive fields map to a single column
+                let column = column_infos.next().unwrap();
+                column
+                    .page_infos
+                    .iter()
+                    .cloned()
+                    .map(|page_info| {
+                        Box::new(PrimitiveFieldScheduler::new(
+                            field.data_type().clone(),
+                            page_info,
+                        )) as Box<dyn LogicalPageScheduler>
+                    })
+                    .collect::<Vec<_>>()
+            }
             _ => todo!(),
         }
     }
@@ -244,7 +258,7 @@ pub trait PhysicalPageDecoder: Send + Sync {
     );
 }
 
-pub trait PhysicalPageScheduler {
+pub trait PhysicalPageScheduler: Send + Sync {
     fn schedule_range(
         &self,
         range: Range<u32>,
@@ -252,22 +266,13 @@ pub trait PhysicalPageScheduler {
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>;
 }
 
-pub struct Scheduled2 {
-    pub decoder: Box<dyn LogicalPageDecoder>,
-    pub rows_taken: u32,
-}
-
-pub trait LogicalPageScheduler {
-    fn schedule_next(
-        &mut self,
-        range: Range<u64>,
+pub trait LogicalPageScheduler: Send + Sync {
+    fn schedule_range(
+        &self,
+        range: Range<u32>,
         scheduler: &Arc<dyn FileScheduler2>,
-    ) -> Result<Scheduled2>;
-    fn schedule_all(
-        &mut self,
-        range: Range<u64>,
-        scheduler: Arc<dyn FileScheduler2>,
     ) -> Result<Box<dyn LogicalPageDecoder>>;
+    fn num_rows(&self) -> u32;
 }
 
 pub trait DecodeArrayTask: Send {

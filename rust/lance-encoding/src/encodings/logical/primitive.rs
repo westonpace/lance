@@ -22,77 +22,43 @@ use snafu::{location, Location};
 use lance_core::{Error, Result};
 
 use crate::decoder::{
-    ColumnInfo2, DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask,
-    PhysicalPageDecoder, Scheduled2,
+    DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, PageInfo2,
+    PhysicalPageDecoder,
 };
 
 pub struct PrimitiveFieldScheduler {
     data_type: DataType,
-    column: Arc<ColumnInfo2>,
-    scheduled_pages: u32,
+    page: Arc<PageInfo2>,
 }
 
 impl PrimitiveFieldScheduler {
-    pub fn new(data_type: DataType, column: Arc<ColumnInfo2>) -> Self {
-        Self {
-            data_type,
-            column,
-            scheduled_pages: 0,
-        }
+    pub fn new(data_type: DataType, page: Arc<PageInfo2>) -> Self {
+        Self { data_type, page }
     }
 }
 
 impl LogicalPageScheduler for PrimitiveFieldScheduler {
-    fn schedule_next(
-        &mut self,
-        range: std::ops::Range<u64>,
+    fn num_rows(&self) -> u32 {
+        self.page.num_rows
+    }
+
+    fn schedule_range(
+        &self,
+        range: std::ops::Range<u32>,
         scheduler: &Arc<dyn crate::io::FileScheduler2>,
-    ) -> Result<Scheduled2> {
-        let mut next_page = &self.column.page_infos[self.scheduled_pages as usize];
-        let num_rows_desired = range.end - range.start;
-
-        // First, skip any entirely skipped pages
-        let mut rows_to_skip = range.start;
-        while (next_page.num_rows as u64) < rows_to_skip {
-            self.scheduled_pages += 1;
-            rows_to_skip -= next_page.num_rows as u64;
-            next_page = &self.column.page_infos[self.scheduled_pages as usize];
-        }
-
-        // Now we have page that overlaps our range somewhat.  Figure out how many
-        // rows we can take
-        let rows_available = next_page.num_rows as u64 - rows_to_skip;
-        let rows_to_take = rows_available.min(num_rows_desired) as u32;
-
-        let page_start = rows_to_skip as u32;
-        let page_end = page_start + rows_to_take;
-
-        let physical_decoder = next_page
-            .decoder
-            .schedule_range(page_start..page_end, scheduler.as_ref());
-
-        self.scheduled_pages += 1;
+    ) -> Result<Box<dyn LogicalPageDecoder>> {
+        let physical_decoder = self.page.decoder.schedule_range(range, scheduler.as_ref());
+        let num_rows = range.end - range.start;
 
         let logical_decoder = PrimitiveFieldDecoder {
             data_type: self.data_type.clone(),
             unloaded_physical_decoder: Some(physical_decoder),
             physical_decoder: None,
             rows_drained: 0,
-            num_rows: rows_to_take,
+            num_rows,
         };
 
-        Ok(Scheduled2 {
-            decoder: Box::new(logical_decoder),
-            rows_taken: rows_to_take,
-        })
-    }
-
-    fn schedule_all(
-        &mut self,
-        _range: std::ops::Range<u64>,
-        _scheduler: Arc<dyn crate::io::FileScheduler2>,
-    ) -> Result<Box<dyn crate::decoder::LogicalPageDecoder>> {
-        todo!()
+        Ok(Box::new(logical_decoder))
     }
 }
 
