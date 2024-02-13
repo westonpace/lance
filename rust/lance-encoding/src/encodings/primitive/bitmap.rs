@@ -11,7 +11,7 @@ use lance_core::Result;
 use crate::{
     decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
     encoder::{ArrayEncoder, EncodedArray, EncodedBuffer},
-    io::FileScheduler2,
+    EncodingsIo,
 };
 
 /// A physical scheduler for bitmap buffers encoded densely as 1 bit per value
@@ -25,7 +25,7 @@ impl PhysicalPageScheduler for DenseBitmapScheduler {
     fn schedule_range(
         &self,
         range: Range<u32>,
-        scheduler: &dyn FileScheduler2,
+        scheduler: &dyn EncodingsIo,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         debug_assert_ne!(range.start, range.end);
         let start = range.start as u64 / 8;

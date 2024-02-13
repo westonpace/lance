@@ -13,7 +13,10 @@ use tokio::task::JoinHandle;
 
 use lance_core::{Error, Result};
 
-use crate::decoder::{DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask};
+use crate::{
+    decoder::{DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask},
+    EncodingsIo,
+};
 
 /// A page scheduler for list fields that encodes offsets in one field and items in another
 ///
@@ -96,7 +99,7 @@ impl LogicalPageScheduler for ListPageScheduler {
     fn schedule_range(
         &self,
         range: std::ops::Range<u32>,
-        scheduler: &Arc<dyn crate::io::FileScheduler2>,
+        scheduler: &Arc<dyn EncodingsIo>,
     ) -> Result<Box<dyn LogicalPageDecoder>> {
         let num_rows = range.end - range.start;
         let num_offsets = num_rows + 1;

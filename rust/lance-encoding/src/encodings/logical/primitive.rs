@@ -21,9 +21,12 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 
-use crate::decoder::{
-    DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, PageInfo2,
-    PhysicalPageDecoder,
+use crate::{
+    decoder::{
+        DecodeArrayTask, LogicalPageDecoder, LogicalPageScheduler, NextDecodeTask, PageInfo,
+        PhysicalPageDecoder,
+    },
+    EncodingsIo,
 };
 
 /// A page schedule for primitive fields
@@ -34,7 +37,7 @@ use crate::decoder::{
 /// which is exactly what we need to create a primitive array.
 pub struct PrimitivePageScheduler {
     data_type: DataType,
-    page: Arc<PageInfo2>,
+    page: Arc<PageInfo>,
 }
 
 impl PrimitivePageScheduler {
@@ -46,7 +49,7 @@ impl PrimitivePageScheduler {
     ///   (although our definition of primitive here includes boolean and fixed size list
     ///   which is slightly different than arrow-rs' definition)
     /// * `page` - The physical page info
-    pub fn new(data_type: DataType, page: Arc<PageInfo2>) -> Self {
+    pub fn new(data_type: DataType, page: Arc<PageInfo>) -> Self {
         Self { data_type, page }
     }
 }
@@ -59,7 +62,7 @@ impl LogicalPageScheduler for PrimitivePageScheduler {
     fn schedule_range(
         &self,
         range: std::ops::Range<u32>,
-        scheduler: &Arc<dyn crate::io::FileScheduler2>,
+        scheduler: &Arc<dyn EncodingsIo>,
     ) -> Result<Box<dyn LogicalPageDecoder>> {
         let num_rows = range.end - range.start;
         let physical_decoder = self.page.decoder.schedule_range(range, scheduler.as_ref());

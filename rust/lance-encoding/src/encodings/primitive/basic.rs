@@ -2,7 +2,7 @@ use futures::{future::BoxFuture, FutureExt};
 
 use crate::{
     decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
-    io::FileScheduler2,
+    EncodingsIo,
 };
 
 use lance_core::Result;
@@ -53,7 +53,7 @@ impl PhysicalPageScheduler for BasicPageScheduler {
     fn schedule_range(
         &self,
         range: std::ops::Range<u32>,
-        scheduler: &dyn FileScheduler2,
+        scheduler: &dyn EncodingsIo,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let validity_future = match &self.validity_decoder {
             PageValidity::NoNull => None,

@@ -12,41 +12,87 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::encodings::logical::primitive::PrimitivePageScheduler;
-use crate::io::FileScheduler2;
+use crate::EncodingsIo;
 
-pub trait DataDecoder: Send {
-    fn load<'a>(&'a mut self) -> BoxFuture<'a, Result<()>>;
-    fn update_capacity(&self, rows_to_skip: u32, num_rows: u32, buffers: &mut [(u64, bool)]);
-    fn drain(
-        &self,
-        // TODO: Coalesce on read and change this to &[Bytes]
-        rows_to_skip: u32,
-        num_rows: u32,
-        dest_offset: u32,
-        dest_buffers: &mut [BytesMut],
-    );
-}
-
-pub struct PageInfo2 {
+/// Metadata describing a page in a file
+///
+/// This is typically created by reading the metadata section of a Lance file
+pub struct PageInfo {
+    /// The number of rows in the page
     pub num_rows: u32,
+    /// The physical decoder that explains the buffers in the page
     pub decoder: Arc<dyn PhysicalPageScheduler>,
+    /// The offsets of the buffers in the file
     pub buffer_offsets: Arc<Vec<u64>>,
 }
 
-pub struct ColumnInfo2 {
-    pub page_infos: Vec<Arc<PageInfo2>>,
+/// Metadata describing a column in a file
+///
+/// This is typically created by reading the metadata section of a Lance file
+pub struct ColumnInfo {
+    /// The metadata for each page in the column
+    pub page_infos: Vec<Arc<PageInfo>>,
 }
 
-impl ColumnInfo2 {
-    pub fn new(page_infos: Vec<Arc<PageInfo2>>) -> Self {
+impl ColumnInfo {
+    /// Create a new instance
+    pub fn new(page_infos: Vec<Arc<PageInfo>>) -> Self {
         Self { page_infos }
     }
 }
 
-pub struct BatchScheduler {
+/// The scheduler for decoding batches
+///
+/// Lance decoding is done in two steps, scheduling, and decoding.  The
+/// scheduling tends to be lightweight and should quickly figure what data
+/// is needed from the disk and I/O requests are issued.  A decode task is
+/// created to eventually decode the data (once it is loaded) and scheduling
+/// moves on to scheduling the next page.
+///
+/// Meanwhile, it's expected that a decode stream will be setup to run at the
+/// same time.  Decode tasks take the data that is loaded and turn it into
+/// Arrow arrays.
+///
+/// This approach allows us to keep our I/O parallelism and CPU parallelism
+/// completely separate since those are often two very different values.
+///
+/// Backpressure should be achieved via the I/O service.  Requests that are
+/// issued will pile up if the decode stream is not polling quickly enough.
+/// The [`crate::EncodingsIo::submit_request`] function should return a pending
+/// future once there are too many I/O requests in flight.
+///
+/// ```text
+///
+///                                    I/O PARALLELISM
+///                       Issues
+///                       Requests   ┌─────────────────┐
+///                                  │                 │        Wait for
+///                       ┌──────────►   I/O Service   ├─────►  Enough I/O ◄─┐
+///                       │          │                 │        For batch    │
+///                       │          └─────────────────┘             │3      │
+///                       │                                          │       │
+///                       │                                          │       │2
+/// ┌─────────────────────┴─┐                              ┌─────────▼───────┴┐
+/// │                       │                              │                  │Poll
+/// │       Batch Decode    │ Decode tasks sent via channel│   Batch Decode   │1
+/// │       Scheduler       ├─────────────────────────────►│   Stream         ◄─────
+/// │                       │                              │                  │
+/// └─────▲─────────────┬───┘                              └─────────┬────────┘
+///       │             │                                            │4
+///       │             │                                            │
+///       └─────────────┘                                   ┌────────┴────────┐
+///  Caller of schedule_range                Buffer polling │                 │
+///  will be scheduler thread                to achieve CPU │ Decode Batch    ├────►
+///  and schedule one decode                 parallelism    │ Task            │
+///  task (and all needed I/O)               (thread per    │                 │
+///  per logical page                         batch)        └─────────────────┘
+/// ```
+pub struct DecodeBatchScheduler {
     field_schedulers: Vec<Vec<Box<dyn LogicalPageScheduler>>>,
 }
 
+// As we schedule we keep one of these per column so that we know
+// how far into the column we have already scheduled.
 #[derive(Debug, Clone, Copy)]
 struct FieldWalkStatus {
     rows_to_skip: u64,
@@ -66,10 +112,10 @@ impl FieldWalkStatus {
     }
 }
 
-impl BatchScheduler {
+impl DecodeBatchScheduler {
     fn create_field_scheduler<'a>(
         field: &Field,
-        column_infos: &mut impl Iterator<Item = &'a Arc<ColumnInfo2>>,
+        column_infos: &mut impl Iterator<Item = &'a Arc<ColumnInfo>>,
     ) -> Vec<Box<dyn LogicalPageScheduler>> {
         match field.data_type() {
             DataType::Boolean
@@ -113,7 +159,7 @@ impl BatchScheduler {
         }
     }
 
-    pub fn new(schema: &Schema, column_infos: Vec<Arc<ColumnInfo2>>) -> Self {
+    pub fn new(schema: &Schema, column_infos: Vec<Arc<ColumnInfo>>) -> Self {
         let mut col_info_iter = column_infos.iter();
         let field_schedulers = schema
             .fields
@@ -127,7 +173,7 @@ impl BatchScheduler {
         &mut self,
         range: Range<u64>,
         sink: mpsc::Sender<Box<dyn LogicalPageDecoder>>,
-        scheduler: &Arc<dyn FileScheduler2>,
+        scheduler: &Arc<dyn EncodingsIo>,
     ) -> Result<()> {
         let mut rows_to_read = range.end - range.start;
 
@@ -328,7 +374,7 @@ pub trait PhysicalPageScheduler: Send + Sync {
     fn schedule_range(
         &self,
         range: Range<u32>,
-        scheduler: &dyn FileScheduler2,
+        scheduler: &dyn EncodingsIo,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>;
 }
 
@@ -336,7 +382,7 @@ pub trait LogicalPageScheduler: Send + Sync {
     fn schedule_range(
         &self,
         range: Range<u32>,
-        scheduler: &Arc<dyn FileScheduler2>,
+        scheduler: &Arc<dyn EncodingsIo>,
     ) -> Result<Box<dyn LogicalPageDecoder>>;
     fn num_rows(&self) -> u32;
 }

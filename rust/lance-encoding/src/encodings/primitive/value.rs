@@ -3,14 +3,14 @@ use futures::{future::BoxFuture, FutureExt};
 
 use crate::{
     decoder::{PhysicalPageDecoder, PhysicalPageScheduler},
-    io::FileScheduler2,
+    EncodingsIo,
 };
 
 use lance_core::Result;
 
 /// Scheduler for a simple encoding where buffers of fixed-size items are stored as-is on disk
 #[derive(Debug, Clone, Copy)]
-struct ValuePageScheduler {
+pub struct ValuePageScheduler {
     // TODO: do we really support values greater than 2^32 bytes per value?
     // I think we want to, in theory, but should probably test this case.
     bytes_per_value: u64,
@@ -31,7 +31,7 @@ impl PhysicalPageScheduler for ValuePageScheduler {
     fn schedule_range(
         &self,
         range: std::ops::Range<u32>,
-        scheduler: &dyn FileScheduler2,
+        scheduler: &dyn EncodingsIo,
     ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
         let start = range.start as u64 * self.bytes_per_value;
         let end = range.end as u64 * self.bytes_per_value;

@@ -9,9 +9,11 @@ use lance_core::Result;
 use lance_datagen::{array, gen, RowCount};
 
 use crate::{
-    decoder::{BatchDecodeStream, BatchScheduler, ColumnInfo2, PageInfo2, PhysicalPageScheduler},
+    decoder::{
+        BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, PageInfo, PhysicalPageScheduler,
+    },
     encoder::{ArrayEncoder, EncodedArray},
-    io::FileScheduler2,
+    EncodingsIo,
 };
 
 pub(crate) struct SimulatedScheduler {
@@ -38,7 +40,7 @@ impl SimulatedScheduler {
     }
 }
 
-impl FileScheduler2 for SimulatedScheduler {
+impl EncodingsIo for SimulatedScheduler {
     fn submit_request(&self, ranges: Vec<Range<u64>>) -> BoxFuture<'static, Result<Vec<Bytes>>> {
         std::future::ready(Ok(ranges
             .into_iter()
@@ -86,7 +88,7 @@ pub async fn check_round_trip_encoding(
                 .collect::<Vec<_>>();
             encoded_arrays.push(encoded_array);
 
-            let page_info = PageInfo2 {
+            let page_info = PageInfo {
                 num_rows: rows_per_page as u32,
                 decoder: decoder.clone(),
                 buffer_offsets: Arc::new(buffer_offsets),
@@ -96,12 +98,11 @@ pub async fn check_round_trip_encoding(
             offset += rows_per_page;
         }
 
-        let scheduler =
-            Arc::new(SimulatedScheduler::new(encoded_arrays)) as Arc<dyn FileScheduler2>;
+        let scheduler = Arc::new(SimulatedScheduler::new(encoded_arrays)) as Arc<dyn EncodingsIo>;
 
-        let column_infos = vec![Arc::new(ColumnInfo2::new(page_infos))];
+        let column_infos = vec![Arc::new(ColumnInfo::new(page_infos))];
         let schema = Schema::new(vec![field.clone()]);
-        let mut decode_scheduler = BatchScheduler::new(&schema, column_infos);
+        let mut decode_scheduler = DecodeBatchScheduler::new(&schema, column_infos);
 
         let (tx, rx) = mpsc::channel(1024);
 
