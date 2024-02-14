@@ -120,8 +120,43 @@ impl DecodeBatchScheduler {
     // For example, if a field is a struct field then we expect a header
     // column that could have one of a few different encodings.
     //
-    // If the encoding for a page is "shredded" then the header column will
-    // contain a validity bitmap and the
+    // If the encoding for a page is "non-null shredded" then the header
+    // column will be empty (null pages only) and we will recurse into
+    // the children in the following columns.
+    //
+    // On the other hand, if the field is a list, then we expect the
+    // header column to be an integer column of offsets.
+    //
+    // Finally, if the field is a primitive, then the column should
+    // have the basic encoding.
+    //
+    // TODO: Still lots of research to do here in different ways that
+    // we can map schemas to buffers.
+    //
+    // Example: repetition levels - the validity bitmaps for nested
+    // fields are fatter (more than one bit per row) and contain
+    // validity information about parent fields (e.g. is this a
+    // struct-struct-null or struct-null-null or null-null-null?)
+    //
+    // Examples: sentinel-shredding - instead of creating a wider
+    // validity bitmap we assign more sentinels to each column.  So
+    // if the values of an int32 array have a max of 1000 then we can
+    // use 1001 to mean null int32 and 1002 to mean null parent.
+    //
+    // Examples: Sparse structs - the struct column has a validity
+    // bitmap that must be read if you plan on reading the struct
+    // or any nested field.  However, this could be a compressed
+    // bitmap stored in metadata.  A perk for this approach is that
+    // the child fields can then have a smaller size than the parent
+    // field.  E.g. if a struct is 1000 rows and 900 of them are
+    // null then there is one validity bitmap of length 1000 and
+    // 100 rows of each of the children.
+    //
+    // Examples: How to do RLE or dictionary encoded structs?
+    //
+    // TODO: In the future, this will need to be more flexible if
+    // we want to allow custom encodings.  E.g. if the field's encoding
+    // is not an encoding we expect then we should delegate to a plugin.
     fn create_field_scheduler<'a>(
         field: &Field,
         column_infos: &mut impl Iterator<Item = &'a Arc<ColumnInfo>>,
@@ -168,6 +203,12 @@ impl DecodeBatchScheduler {
         }
     }
 
+    /// Creates a new decode scheduler with the expected schema and the column
+    /// metadata of the file.
+    ///
+    /// TODO: How does this work when doing projection?  Need to add tests.  Can
+    /// probably take care of this in lance-file by only passing in the appropriate
+    /// columns with the projected schema.
     pub fn new(schema: &Schema, column_infos: Vec<Arc<ColumnInfo>>) -> Self {
         let mut col_info_iter = column_infos.iter();
         let field_schedulers = schema
@@ -178,6 +219,13 @@ impl DecodeBatchScheduler {
         Self { field_schedulers }
     }
 
+    /// Schedules the load of a range of rows
+    ///
+    /// # Arguments
+    ///
+    /// * `range` - The range of rows to load
+    /// * `sink` - A channel to send the decode tasks
+    /// * `scheduler` An I/O scheduler to issue I/O requests
     pub async fn schedule_range(
         &mut self,
         range: Range<u64>,
@@ -189,6 +237,16 @@ impl DecodeBatchScheduler {
         let mut field_status =
             vec![FieldWalkStatus::new_from_range(range); self.field_schedulers.len()];
 
+        // NOTE: The order in which we are scheduling tasks here is very important.  We want to schedule the I/O so that
+        // we can deliver completed rows as quickly as possible to the decoder.  This means we want to schedule in row-major
+        // order from start to the end.  E.g. if we schedule one column at a time then the decoder is going to have to wait
+        // until almost all the I/O is finished before it can return a single batch.
+        //
+        // Luckily, we can do this using a simple greedy algorithm.  We iterate through each column independently.  For each
+        // pass through the metadata we look for any column that doesn't have any "queued rows".  Once we find it we schedule
+        // the next page for that column and increase its queued rows.  After each pass we should have some data queued for
+        // each column.  We take the column with the least amount of queued data and decrement that amount from the queued
+        // rows total of all columns.
         while rows_to_read > 0 {
             let mut min_rows_added = u32::MAX;
             for (col_idx, field_scheduler) in self.field_schedulers.iter().enumerate() {
@@ -231,6 +289,8 @@ impl DecodeBatchScheduler {
     }
 }
 
+// Represents the work to decode a single batch of data.  This is a CPU
+// driven task where we untangle any sophisticated encodings.
 struct DecodeBatchTask {
     columns: Vec<Vec<Box<dyn DecodeArrayTask>>>,
     schema: Schema,
@@ -262,6 +322,7 @@ struct PartiallyDecodedPage {
     col_index: u32,
 }
 
+/// A stream that takes scheduled jobs and generates decode tasks from them.
 pub struct BatchDecodeStream {
     scheduled: mpsc::Receiver<Box<dyn LogicalPageDecoder>>,
     partial_pages: VecDeque<PartiallyDecodedPage>,
