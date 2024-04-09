@@ -204,11 +204,12 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use log::trace;
 use snafu::{location, Location};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, unbounded_channel};
 use tokio::task::JoinHandle;
 
 use lance_core::{Error, Result};
 
+use crate::encoder::EncodedBatch;
 use crate::encodings::logical::fixed_size_list::FslPageScheduler;
 use crate::encodings::logical::list::ListPageScheduler;
 use crate::encodings::logical::primitive::PrimitivePageScheduler;
@@ -216,7 +217,7 @@ use crate::encodings::logical::r#struct::SimpleStructScheduler;
 use crate::encodings::logical::utf8::Utf8PageScheduler;
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb;
-use crate::EncodingsIo;
+use crate::{BufferScheduler, EncodingsIo};
 
 /// Metadata describing a page in a file
 ///
@@ -655,7 +656,7 @@ pub trait PhysicalPageDecoder: Send + Sync {
     /// Decodes the data into the requested buffers.
     ///
     /// You can assume that the capacity will have already been configured on the `BytesMut`
-    /// according to the capacity calculated in [`Self::update_capacity`]
+    /// according to the capacity calculated in [`PhysicalPageDecoder::update_capacity`]
     ///
     /// # Arguments
     ///
@@ -774,4 +775,17 @@ pub trait LogicalPageDecoder: Send {
     fn unawaited(&self) -> u32;
     /// The number of rows that have been "waited" but not yet decoded
     fn avail(&self) -> u32;
+}
+
+/// Decodes a batch of data from an in-memory structure created by [`crate::encoder::encode_batch`]
+pub async fn decode_batch(batch: &EncodedBatch) -> Result<RecordBatch> {
+    let mut decode_scheduler =
+        DecodeBatchScheduler::new(batch.schema.as_ref(), &batch.page_table, &vec![]);
+    let (tx, rx) = unbounded_channel();
+    let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
+    decode_scheduler
+        .schedule_range(0..batch.num_rows, tx, &io_scheduler)
+        .await?;
+    let stream = BatchDecodeStream::new(rx, batch.num_rows as u32, batch.num_rows);
+    stream.into_stream().next().await.unwrap().await.unwrap()
 }
