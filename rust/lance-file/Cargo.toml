@@ -26,7 +26,6 @@ async-recursion.workspace = true
 async-trait.workspace = true
 byteorder.workspace = true
 bytes.workspace = true
-datafusion-common.workspace = true
 deepsize.workspace = true
 futures.workspace = true
 lance-datagen.workspace = true
@@ -40,14 +39,24 @@ roaring.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+datafusion-common = { version = "38", path = "/home/pace/dev/arrow-datafusion/datafusion/common" }
 
 [dev-dependencies]
+tracing-chrome = { version = "0.7.1" }
+tracing-subscriber = { version = "0.3.17" }
+
 criterion.workspace = true
 rand.workspace = true
 tempfile.workspace = true
 proptest.workspace = true
 pretty_assertions.workspace = true
 test-log.workspace = true
+datafusion = { version = "38", path = "/home/pace/dev/arrow-datafusion/datafusion/core" }
+datafusion-execution = { version = "38", path = "/home/pace/dev/arrow-datafusion/datafusion/execution" }
+datafusion-physical-expr = { version = "38", path = "/home/pace/dev/arrow-datafusion/datafusion/physical-expr" }
+datafusion-physical-plan = { version = "38", path = "/home/pace/dev/arrow-datafusion/datafusion/physical-plan" }
+lance-test-macros.workspace = true
+
 
 [build-dependencies]
 prost-build.workspace = true
