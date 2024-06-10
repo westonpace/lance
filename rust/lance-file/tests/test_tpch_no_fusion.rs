@@ -14,7 +14,7 @@ use datafusion_physical_plan::{
     stream::RecordBatchStreamAdapter, DisplayAs, ExecutionMode, ExecutionPlan, Partitioning,
     PlanProperties,
 };
-use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt};
+use futures::{stream::BoxStream, Stream, StreamExt};
 use lance_file::v2::reader::{FileReader, ReaderProjection};
 use lance_io::{object_store::ObjectStore, scheduler::ScanScheduler, ReadBatchParams};
 use object_store::path::Path;
@@ -100,8 +100,10 @@ impl LanceScanExec {
             .to_df_err()?
             .fuse()
             .map(|task| {
-                task.task
-                    .map_err(|err| datafusion_common::DataFusionError::External(err.into()))
+                async move {
+                    let res = tokio::spawn(task.task).await.unwrap();
+                    res.map_err(|err| datafusion_common::DataFusionError::External(err.into()))
+                }
             })
             .buffered(CPU_PARALLELISM as usize)
             .boxed();
