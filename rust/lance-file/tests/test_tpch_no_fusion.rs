@@ -57,7 +57,8 @@ impl DisplayAs for LanceScanExec {
 
 const IO_PARALLELISM: u32 = 16;
 
-async fn next_task(batches: LockedBatchStream) -> Option<(Result<RecordBatch>, LockedBatchStream)> {
+async fn next_task(batches: LockedBatchStream, part: usize) -> Option<(Result<RecordBatch>, LockedBatchStream)> {
+    println!("Grabbing for partition {}", part);
     let mut batches_ref = batches.lock().await;
     let batch = batches_ref.next().await;
     drop(batches_ref);
@@ -68,8 +69,8 @@ async fn next_task(batches: LockedBatchStream) -> Option<(Result<RecordBatch>, L
     }
 }
 
-fn scan_stream(tasks: LockedBatchStream) -> impl Stream<Item = Result<RecordBatch>> {
-    futures::stream::unfold(tasks, |tasks| next_task(tasks)).fuse()
+fn scan_stream(tasks: LockedBatchStream, part: usize) -> impl Stream<Item = Result<RecordBatch>> {
+    futures::stream::unfold(tasks, move |tasks| next_task(tasks, part)).fuse()
 }
 
 impl LanceScanExec {
@@ -139,10 +140,10 @@ impl ExecutionPlan for LanceScanExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let stream = scan_stream(self.batches.clone());
+        let stream = scan_stream(self.batches.clone(), partition);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.output_schema.clone(),
             stream,
