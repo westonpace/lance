@@ -631,6 +631,18 @@ def test_append_with_commit(tmp_path: Path):
     assert tbl == expected
 
 
+def test_delete_indexed(tmp_path: Path):
+    table = pa.table({"ID": [1, 2, 3]})
+    base_dir = tmp_path / "test"
+
+    ds = lance.write_dataset(table, base_dir)
+    ds.create_scalar_index("ID", "BTREE")
+    ds = lance.dataset(base_dir)
+
+    ds.delete("`ID` = 2")
+    assert ds.to_table() == pa.table({"ID": [1, 3]})
+
+
 def test_delete_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

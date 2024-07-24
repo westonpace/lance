@@ -215,6 +215,7 @@ impl TakeExec {
         extra_schema: Arc<Schema>,
         batch_readahead: usize,
     ) -> Result<Self> {
+        println!("Extra schema A: {:?}", extra_schema);
         if input.schema().column_with_name(ROW_ID).is_none() {
             return Err(DataFusionError::Plan(
                 "TakeExec requires the input plan to have a column named '_rowid'".to_string(),

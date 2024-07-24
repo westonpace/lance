@@ -953,6 +953,7 @@ impl Scanner {
             )?;
         }
         if let Some(additional_schema) = additional_schema {
+            println!("Take additional: {:?}", additional_schema);
             plan = self.take(plan, &additional_schema, self.batch_readahead)?;
         }
 
@@ -979,6 +980,7 @@ impl Scanner {
             let remaining_schema = order_by_schema.exclude(plan.schema().as_ref())?;
             if !remaining_schema.fields.is_empty() {
                 // We haven't loaded the sort column yet so take it now
+                println!("Take remaining: {:?}", remaining_schema);
                 plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
             }
             let col_exprs = ordering
@@ -1002,12 +1004,15 @@ impl Scanner {
         }
 
         // Stage 5: take remaining columns required for projection
-        let physical_schema = self.physical_schema(false)?;
-        let remaining_schema = physical_schema.exclude(plan.schema().as_ref())?;
+        let remaining_schema = self
+            .projection_plan
+            .physical_schema
+            .exclude(plan.schema().as_ref())?;
         if !remaining_schema.fields.is_empty() {
             plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
         }
         // Stage 6: physical projection -- reorder physical columns needed before final projection
+        let physical_schema = self.physical_schema(false)?;
         let output_arrow_schema = physical_schema.as_ref().into();
         if plan.schema().as_ref() != &output_arrow_schema {
             plan = Arc::new(ProjectionExec::try_new(plan, physical_schema)?);
