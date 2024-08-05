@@ -172,6 +172,7 @@ async fn do_transform_vectors(
         .infer_error()?;
 
     let (obj_store, path) = object_store_from_uri_or_path(dst_uri).await?;
+    println!("Writing transformed vectors to {:?}", path);
     let writer = obj_store.create(&path).await.infer_error()?;
     write_vector_storage(
         transform_input,
