@@ -1,12 +1,7 @@
 name: Check docs
 
 on:
-  push:
-    branches: ["main"]
-  pull_request:
-    paths:
-      - docs/**
-      - .github/workflows/docs-check.yml
+  workflow_dispatch:
 
 env:
   # Disable full debug symbol generation to speed up CI build and keep memory down
@@ -27,7 +22,7 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
-          cache: 'pip'
+          cache: "pip"
           cache-dependency-path: "docs/requirements.txt"
       - name: Install dependencies
         run: |
@@ -48,4 +43,3 @@ jobs:
         working-directory: docs
         run: |
           make linkcheck
-

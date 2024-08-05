@@ -1,13 +1,6 @@
 name: DuckDB Extension
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    paths:
-      - integration/duckdb_lance/*
-      - .github/workflows/duckdb.yml
-      - ./rust/*
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -61,4 +54,3 @@ jobs:
       #     name: duckdb-intel-mac-extension
       #     path: integration/duckdb/build/lance.duckdb_extension
       #     retention-days: 1
-

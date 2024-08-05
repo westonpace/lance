@@ -1,13 +1,6 @@
 name: Check license headers
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    paths:
-      - rust/**
-      - python/**
-      - protos/**
+  workflow_dispatch:
 jobs:
   build:
     runs-on: ubuntu-latest

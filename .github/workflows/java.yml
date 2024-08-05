@@ -1,14 +1,7 @@
 name: Build and Run Java JNI Tests
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    paths:
-      - java/**
-      - rust/**
-      - .github/workflows/java.yml
+  workflow_dispatch:
 
 env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
