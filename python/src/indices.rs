@@ -11,6 +11,7 @@ use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
 };
 use lance_linalg::distance::DistanceType;
+use pyo3::exceptions::PyValueError;
 use pyo3::{
     pyfunction,
     types::{PyList, PyModule},
@@ -230,7 +231,13 @@ async fn do_shuffle_transformed_vectors(
     dir_path: &str,
     ivf_centroids: FixedSizeListArray,
 ) -> PyResult<Vec<String>> {
-    let partition_files = shuffle_vectors(filenames, dir_path, ivf_centroids)
+    let (obj_store, path) = object_store_from_uri_or_path(dir_path).await?;
+    if !obj_store.is_local() {
+        return Err(PyValueError::new_err(
+            "shuffle_vectors input and output path is currently required to be local",
+        ));
+    }
+    let partition_files = shuffle_vectors(filenames, path, ivf_centroids)
         .await
         .infer_error()?;
     Ok(partition_files)
