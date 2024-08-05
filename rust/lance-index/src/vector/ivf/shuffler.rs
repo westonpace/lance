@@ -314,7 +314,9 @@ impl IvfShuffler {
         let mut total_batches = vec![];
         for buffer in &self.unsorted_buffers {
             let object_store = ObjectStore::local();
+            println!("Accessing buffer: {}", buffer);
             let path = self.output_dir.child(buffer.as_str());
+            println!("At path: {}", path);
 
             if self.is_legacy {
                 let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;

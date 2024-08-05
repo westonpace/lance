@@ -232,6 +232,7 @@ async fn do_shuffle_transformed_vectors(
     ivf_centroids: FixedSizeListArray,
 ) -> PyResult<Vec<String>> {
     let (obj_store, path) = object_store_from_uri_or_path(dir_path).await?;
+    println!("{:?} {:?}", obj_store, path);
     if !obj_store.is_local() {
         return Err(PyValueError::new_err(
             "shuffle_vectors input and output path is currently required to be local",
