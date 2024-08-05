@@ -5,6 +5,7 @@ use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
 use lance::index::vector::ivf::builder::write_vector_storage;
+use lance::io::ObjectStore;
 use lance_index::vector::ivf::shuffler::shuffle_vectors;
 use lance_index::vector::{
     ivf::{storage::IvfModel, IvfBuildParams},
@@ -231,7 +232,7 @@ async fn do_shuffle_transformed_vectors(
     dir_path: &str,
     ivf_centroids: FixedSizeListArray,
 ) -> PyResult<Vec<String>> {
-    let (obj_store, path) = object_store_from_uri_or_path(dir_path).await?;
+    let (obj_store, path) = ObjectStore::from_path(dir_path).infer_error()?;
     println!("{:?} {:?}", obj_store, path);
     if !obj_store.is_local() {
         return Err(PyValueError::new_err(
