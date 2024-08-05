@@ -154,6 +154,9 @@ def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
     uri = str(tmpdir / "transformed_shuffle")
     builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
 
+    print(f"Files created by transform at {tmpdir}")
+    print(os.listdir(str(tmpdir)))
+
     # test shuffle for transformed vectors
     filenames = builder.shuffle_transformed_vectors(
         ["transformed_shuffle"], str(tmpdir), rand_ivf
