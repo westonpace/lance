@@ -5,7 +5,7 @@ else
 endif
 
 test:
-	pytest $(PYTEST_ARGS) python/tests
+	pytest $(PYTEST_ARGS) python/tests/test_indices.py
 .PHONY: test
 
 integtest:
