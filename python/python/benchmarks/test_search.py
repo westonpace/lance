@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import random
 import shutil
 from pathlib import Path
 from typing import NamedTuple, Union
@@ -9,6 +10,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from lance.file import LanceFileReader, LanceFileWriter
 
 N_DIMS = 768
 NUM_ROWS = 100_000
@@ -479,3 +481,49 @@ def test_label_list_index_prefilter(test_dataset, benchmark, filter: str):
             prefilter=True,
             filter=filter,
         )
+
+
+@pytest.mark.benchmark(group="scan_vs_search")
+@pytest.mark.parametrize(
+    "payload_size",
+    [8, 256, 4096, 65536, 1048576],
+)
+@pytest.mark.parametrize(
+    "rows_to_fetch",
+    [1, 100, 10000, 1000000],
+)
+@pytest.mark.parametrize(
+    "use_take",
+    [False, True],
+)
+def test_scan_vs_take(
+    benchmark, tmpdir, payload_size: int, rows_to_fetch: int, use_take: bool
+):
+    num_rows = 1024 * 1024 * 1024 // payload_size
+    print(f"Allocating buffer of size {payload_size * num_rows} bytes")
+    buf = pa.allocate_buffer(size=payload_size * num_rows)
+    print("Creating arrow array")
+    arr = pa.Array.from_buffers(pa.binary(payload_size), num_rows, [None, buf])
+
+    print("Writing file")
+    path = str(tmpdir / "scan_vs_search.lance")
+    with LanceFileWriter(path) as writer:
+        writer.write_batch(pa.table({"payload": arr}))
+
+    batch_size = max(1, 256 * 1024 // payload_size)
+
+    print("Reading file")
+    reader = LanceFileReader(path)
+    if use_take:
+        print("Shuffling ids")
+        row_ids = random.sample(range(num_rows), rows_to_fetch)
+        row_ids.sort()
+
+        def bench():
+            reader.take_rows(row_ids, batch_size=batch_size).to_table()
+    else:
+
+        def bench():
+            reader.read_all(batch_size=batch_size).to_table()
+
+    benchmark.pedantic(bench, rounds=1, iterations=1)

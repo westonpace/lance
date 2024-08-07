@@ -462,6 +462,7 @@ impl Dataset {
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
         full_text_query: Option<&PyDict>,
+        with_late_materialization: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -552,6 +553,10 @@ impl Dataset {
 
         if let Some(true) = fast_search {
             scanner.fast_search();
+        }
+
+        if let Some(late_materialization) = with_late_materialization {
+            scanner.with_late_materialization(late_materialization);
         }
 
         if let Some(fragments) = fragments {

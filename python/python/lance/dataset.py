@@ -2135,6 +2135,7 @@ class ScannerBuilder:
         self._use_stats = True
         self._fast_search = None
         self._full_text_query = None
+        self._with_late_materialization = None
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -2235,6 +2236,14 @@ class ScannerBuilder:
         """Enable returns with row IDs."""
         self._with_row_id = with_row_id
         return self
+
+    def with_late_materialization(
+        self, late_materialization: bool = True
+    ) -> ScannerBuilder:
+        """
+        Enable late materialization for columns.
+        """
+        self._with_late_materialization = late_materialization
 
     def use_stats(self, use_stats: bool = True) -> ScannerBuilder:
         """
@@ -2358,6 +2367,7 @@ class ScannerBuilder:
             self._substrait_filter,
             self._fast_search,
             self._full_text_query,
+            self._with_late_materialization,
         )
         return LanceScanner(scanner, self.ds)
 

@@ -194,6 +194,10 @@ pub struct Scanner {
     /// If set, this scanner serves only these fragments.
     fragments: Option<Vec<Fragment>>,
 
+    /// If set, the scanner will first scan only the filtered columns
+    /// and then take the remaining columns.
+    late_materialization: Option<bool>,
+
     /// Only search the data being indexed (weak consistency search).
     ///
     /// Default value is false.
@@ -233,6 +237,7 @@ impl Scanner {
             ordered: true,
             fragments: None,
             fast_search: false,
+            late_materialization: None,
         }
     }
 
@@ -414,6 +419,11 @@ impl Scanner {
     /// This is only used if ``scan_in_order`` is set to false.
     pub fn fragment_readahead(&mut self, nfragments: usize) -> &mut Self {
         self.fragment_readahead = Some(nfragments);
+        self
+    }
+
+    pub fn with_late_materialization(&mut self, late_materialization: bool) -> &mut Self {
+        self.late_materialization = Some(late_materialization);
         self
     }
 
