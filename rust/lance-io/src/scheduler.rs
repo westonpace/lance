@@ -137,11 +137,6 @@ impl BackpressureThrottle {
     async fn acquire_permit(&self, num_bytes: u64) -> u64 {
         // First, try and acquire the permit without waiting
         let permits_needed = num_bytes.min(self.capacity).min(u32::MAX as u64);
-        log::trace!(
-            "Attempting to acquire {} permits to load {} bytes",
-            permits_needed,
-            num_bytes
-        );
         if permits_needed < num_bytes {
             log::warn!(
                 "I/O request for {} bytes exceeds the I/O buffer size of {}",
@@ -152,11 +147,6 @@ impl BackpressureThrottle {
         let permit = self.semaphore.try_acquire_many(permits_needed as u32);
         match permit {
             Ok(permit) => {
-                log::trace!(
-                    "Acquired {} permits ({} remaining)",
-                    permits_needed,
-                    self.semaphore.available_permits()
-                );
                 permit.forget();
                 return permits_needed;
             }
@@ -172,11 +162,6 @@ impl BackpressureThrottle {
         if let Some(deadline) = self.deadlock_prevention_timeout {
             match tokio::time::timeout(deadline, wait_for_backpressure).await {
                 Ok(Ok(permit)) => {
-                    log::trace!(
-                        "Acquired {} permits ({} remaining)",
-                        permits_needed,
-                        self.semaphore.available_permits()
-                    );
                     permit.forget();
                     permits_needed
                 }
@@ -199,11 +184,6 @@ impl BackpressureThrottle {
         } else {
             match wait_for_backpressure.await {
                 Ok(permit) => {
-                    log::trace!(
-                        "Acquired {} permits ({} remaining)",
-                        permits_needed,
-                        self.semaphore.available_permits()
-                    );
                     permit.forget();
                     permits_needed
                 }
@@ -234,11 +214,6 @@ impl IoTask {
     }
 
     async fn run(self) {
-        log::trace!(
-            "Issuing I/O request for {} bytes and {} permits to release",
-            self.num_bytes(),
-            self.permits_to_realease
-        );
         let bytes_fut = self
             .reader
             .get_range(self.to_read.start as usize..self.to_read.end as usize);
@@ -254,21 +229,20 @@ async fn run_io_loop(
     backpressure_throttle: Arc<BackpressureThrottle>,
     io_capacity: u32,
 ) {
-    log::trace!("Starting io loop");
     let mut in_process = FuturesUnordered::new();
+
+    let run_task = |mut task: IoTask| async {
+        let permits_acquired = backpressure_throttle.acquire_permit(task.num_bytes()).await;
+        task.set_permits_to_release(permits_acquired);
+        tokio::spawn(task.run())
+    };
 
     // First, prime the queue up to io_capacity
     for _ in 0..io_capacity {
         let next_task = tasks.recv().await;
         match next_task {
             Ok(task) => {
-                let mut task = task.0;
-                log::trace!("About to acquire permits");
-                let permits_acquired = backpressure_throttle.acquire_permit(task.num_bytes()).await;
-                task.set_permits_to_release(permits_acquired);
-                log::trace!("Spawning I/O task with {} bytes", task.num_bytes());
-                let handle = tokio::spawn(task.run());
-                in_process.push(handle);
+                in_process.push(run_task(task.0).await);
             }
             Err(async_priority_channel::RecvError) => {
                 // The sender has been dropped, we are done
@@ -284,8 +258,7 @@ async fn run_io_loop(
         let next_task = tasks.recv().await;
         match next_task {
             Ok(task) => {
-                let handle = tokio::spawn(task.0.run());
-                in_process.push(handle);
+                in_process.push(run_task(task.0).await);
             }
             Err(async_priority_channel::RecvError) => {
                 // The sender has been dropped, we are done
