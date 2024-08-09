@@ -230,6 +230,7 @@ impl IoTask {
     }
 
     async fn run(self) {
+        log::trace!("Issuing I/O request for {} bytes", self.num_bytes());
         let bytes_fut = self
             .reader
             .get_range(self.to_read.start as usize..self.to_read.end as usize);
