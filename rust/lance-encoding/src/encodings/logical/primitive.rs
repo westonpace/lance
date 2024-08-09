@@ -46,6 +46,7 @@ pub struct PrimitiveFieldScheduler {
     page_schedulers: Vec<PrimitivePage>,
     num_rows: u64,
     should_validate: bool,
+    backpressure_id: u32,
 }
 
 impl PrimitiveFieldScheduler {
@@ -54,6 +55,7 @@ impl PrimitiveFieldScheduler {
         pages: Arc<[PageInfo]>,
         buffers: ColumnBuffers,
         should_validate: bool,
+        backpressure_id: u32,
     ) -> Self {
         let page_schedulers = pages
             .iter()
@@ -76,6 +78,7 @@ impl PrimitiveFieldScheduler {
             page_schedulers,
             num_rows,
             should_validate,
+            backpressure_id,
         }
     }
 }
@@ -162,10 +165,12 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
         self.global_row_offset += cur_page.num_rows;
         self.page_idx += 1;
 
-        let physical_decoder =
-            cur_page
-                .scheduler
-                .schedule_ranges(&ranges_in_page, context.io(), top_level_row);
+        let physical_decoder = cur_page.scheduler.schedule_ranges(
+            &ranges_in_page,
+            context.io(),
+            top_level_row,
+            self.scheduler.backpressure_id,
+        );
 
         let logical_decoder = PrimitiveFieldDecoder {
             data_type: self.scheduler.data_type.clone(),

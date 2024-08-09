@@ -123,6 +123,7 @@ impl PageScheduler for BinaryPageScheduler {
         ranges: &[std::ops::Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
+        backpressure_id: u32,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         // ranges corresponds to row ranges that the user wants to fetch.
         // if user wants row range a..b
@@ -141,9 +142,12 @@ impl PageScheduler for BinaryPageScheduler {
 
         // We schedule all the indices for decoding together
         // This is more efficient compared to scheduling them one by one (reduces speed significantly for random access)
-        let indices_page_decoder =
-            self.indices_scheduler
-                .schedule_ranges(&indices_ranges, scheduler, top_level_row);
+        let indices_page_decoder = self.indices_scheduler.schedule_ranges(
+            &indices_ranges,
+            scheduler,
+            top_level_row,
+            backpressure_id,
+        );
 
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         let indices_num_rows = indices_ranges.iter().map(|r| r.end - r.start).sum::<u64>();
@@ -211,8 +215,12 @@ impl PageScheduler for BinaryPageScheduler {
             // In the indirect task we schedule the bytes, but we do not await them.  We don't want to
             // await the bytes until the decoder is ready for them so that we don't release the backpressure
             // too early
-            let bytes_decoder_fut =
-                copy_bytes_scheduler.schedule_ranges(&bytes_ranges, &copy_scheduler, top_level_row);
+            let bytes_decoder_fut = copy_bytes_scheduler.schedule_ranges(
+                &bytes_ranges,
+                &copy_scheduler,
+                top_level_row,
+                backpressure_id,
+            );
 
             Ok(IndirectData {
                 decoded_indices,

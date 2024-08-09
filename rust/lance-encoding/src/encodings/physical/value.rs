@@ -86,6 +86,7 @@ impl PageScheduler for ValuePageScheduler {
         ranges: &[std::ops::Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
+        backpressure_id: u32,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let (mut min, mut max) = (u64::MAX, 0);
         let byte_ranges = if self.compression_scheme == CompressionScheme::None {
@@ -116,7 +117,7 @@ impl PageScheduler for ValuePageScheduler {
             min,
             max
         );
-        let bytes = scheduler.submit_request(byte_ranges, top_level_row);
+        let bytes = scheduler.submit_request(byte_ranges, top_level_row, backpressure_id);
         let bytes_per_value = self.bytes_per_value;
 
         let range_offsets = if self.compression_scheme != CompressionScheme::None {

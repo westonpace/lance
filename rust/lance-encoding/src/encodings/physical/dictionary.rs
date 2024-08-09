@@ -60,6 +60,7 @@ impl PageScheduler for DictionaryPageScheduler {
         ranges: &[std::ops::Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
+        backpressure_id: u32,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         // We want to decode indices and items
         // e.g. indices [0, 1, 2, 0, 1, 0]
@@ -69,9 +70,12 @@ impl PageScheduler for DictionaryPageScheduler {
         // These are used to rebuild the string later
 
         // Schedule indices for decoding
-        let indices_page_decoder =
-            self.indices_scheduler
-                .schedule_ranges(ranges, scheduler, top_level_row);
+        let indices_page_decoder = self.indices_scheduler.schedule_ranges(
+            ranges,
+            scheduler,
+            top_level_row,
+            backpressure_id,
+        );
 
         // Schedule items for decoding
         let items_range = 0..(self.num_dictionary_items as u64);
@@ -79,6 +83,7 @@ impl PageScheduler for DictionaryPageScheduler {
             std::slice::from_ref(&items_range),
             scheduler,
             top_level_row,
+            backpressure_id,
         );
 
         let copy_size = self.num_dictionary_items as u64;

@@ -165,6 +165,7 @@ impl FileReader {
             .submit_single(
                 buffer_desc.position..buffer_desc.position + buffer_desc.size,
                 0,
+                0,
             )
             .await
     }
@@ -176,7 +177,7 @@ impl FileReader {
         } else {
             file_size - scheduler.reader().block_size() as u64
         };
-        let tail_bytes = scheduler.submit_single(begin..file_size, 0).await?;
+        let tail_bytes = scheduler.submit_out_of_band(begin..file_size).await?;
         Ok((tail_bytes, file_size))
     }
 
@@ -270,7 +271,7 @@ impl FileReader {
             let num_bytes_missing = (num_bytes_needed - data.len()) as u64;
             let start = file_len - num_bytes_needed as u64;
             let missing_bytes = scheduler
-                .submit_single(start..start + num_bytes_missing, 0)
+                .submit_out_of_band(start..start + num_bytes_missing)
                 .await?;
             let mut combined = BytesMut::with_capacity(data.len() + num_bytes_missing as usize);
             combined.extend(missing_bytes);

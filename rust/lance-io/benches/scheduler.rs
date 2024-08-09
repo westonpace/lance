@@ -102,7 +102,7 @@ fn bench_full_read(c: &mut Criterion) {
                         while offset < DATA_SIZE {
                             #[allow(clippy::single_range_in_vec_init)]
                             let req = vec![offset..(offset + params.page_size)];
-                            let req = file_scheduler.submit_request(req, 0);
+                            let req = file_scheduler.submit_request(req, 0, 0);
                             tx.send(req).await.unwrap();
                             offset += params.page_size;
                         }
@@ -198,7 +198,7 @@ fn bench_random_read(c: &mut Criterion) {
                                     })
                                     .collect::<Vec<_>>();
                                 idx += INDICES_PER_BATCH as usize;
-                                let req = file_scheduler.submit_request(iops, 0);
+                                let req = file_scheduler.submit_request(iops, 0, 0);
                                 tx.send(req).await.unwrap();
                             }
                             drop(tx);

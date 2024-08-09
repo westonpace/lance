@@ -53,6 +53,7 @@ impl EncodingsIo for SimulatedScheduler {
         &self,
         ranges: Vec<Range<u64>>,
         _priority: u64,
+        _backpressure_id: u32,
     ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
         std::future::ready(Ok(ranges
             .into_iter()

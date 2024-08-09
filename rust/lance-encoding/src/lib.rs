@@ -44,6 +44,7 @@ pub trait EncodingsIo: Send + Sync {
         &self,
         range: Vec<Range<u64>>,
         priority: u64,
+        backpressure_id: u32,
     ) -> BoxFuture<'static, Result<Vec<Bytes>>>;
 
     /// Submit an I/O request with a single range
@@ -54,10 +55,16 @@ pub trait EncodingsIo: Send + Sync {
         &self,
         range: std::ops::Range<u64>,
         priority: u64,
+        backpressure_id: u32,
     ) -> BoxFuture<'static, lance_core::Result<bytes::Bytes>> {
-        self.submit_request(vec![range], priority)
+        self.submit_request(vec![range], priority, backpressure_id)
             .map_ok(|mut v| v.pop().unwrap())
             .boxed()
+    }
+
+    /// Submit an I/O request ignoring priority and backpressure
+    fn submit_out_of_band(&self, range: std::ops::Range<u64>) -> BoxFuture<'static, Result<Bytes>> {
+        self.submit_single(range, 0, 0)
     }
 }
 
@@ -81,6 +88,7 @@ impl EncodingsIo for BufferScheduler {
         &self,
         ranges: Vec<Range<u64>>,
         _priority: u64,
+        _backpressure_id: u32,
     ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
         std::future::ready(Ok(ranges
             .into_iter()

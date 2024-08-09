@@ -41,10 +41,11 @@ impl PageScheduler for FsstPageScheduler {
         ranges: &[Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
+        backpressure_id: u32,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
-        let inner_decoder = self
-            .inner_scheduler
-            .schedule_ranges(ranges, scheduler, top_level_row);
+        let inner_decoder =
+            self.inner_scheduler
+                .schedule_ranges(ranges, scheduler, top_level_row, backpressure_id);
         let symbol_table = self.symbol_table.clone();
 
         async move {

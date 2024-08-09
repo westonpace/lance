@@ -38,6 +38,7 @@ impl PageScheduler for DenseBitmapScheduler {
         ranges: &[Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
+        backpressure_id: u32,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let mut min = u64::MAX;
         let mut max = 0;
@@ -65,7 +66,7 @@ impl PageScheduler for DenseBitmapScheduler {
             min,
             max
         );
-        let bytes = scheduler.submit_request(byte_ranges, top_level_row);
+        let bytes = scheduler.submit_request(byte_ranges, top_level_row, backpressure_id);
 
         async move {
             let bytes = bytes.await?;

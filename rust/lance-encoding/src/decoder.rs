@@ -355,6 +355,7 @@ impl DecoderMiddlewareChain {
             io,
             cur_idx: 0,
             path: VecDeque::new(),
+            backpressure_id_counter: 1,
         }
     }
 }
@@ -368,6 +369,7 @@ pub struct DecoderMiddlewareChainCursor<'a> {
     chain: &'a DecoderMiddlewareChain,
     io: &'a Arc<dyn EncodingsIo>,
     path: VecDeque<u32>,
+    backpressure_id_counter: u32,
     cur_idx: usize,
 }
 
@@ -385,6 +387,16 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
     /// Returns the I/O service which can be used to grab column metadata
     pub fn io(&self) -> &Arc<dyn EncodingsIo> {
         self.io
+    }
+
+    pub fn backpressure_id(&mut self, force_new: bool) -> u32 {
+        if !force_new && self.path.is_empty() {
+            0
+        } else {
+            let id = self.backpressure_id_counter;
+            self.backpressure_id_counter += 1;
+            id
+        }
     }
 
     /// Delegates responsibilty to the next encoder in the chain
@@ -623,6 +635,7 @@ impl CoreFieldDecoderStrategy {
         path: &VecDeque<u32>,
         column: &ColumnInfo,
         buffers: FileBuffers,
+        backpressure_id: u32,
     ) -> Result<Arc<dyn FieldScheduler>> {
         Self::ensure_values_encoded(column, path)?;
         // Primitive fields map to a single column
@@ -635,6 +648,7 @@ impl CoreFieldDecoderStrategy {
             column.page_infos.clone(),
             column_buffers,
             self.validate_data,
+            backpressure_id,
         )))
     }
 
@@ -666,16 +680,19 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
         field: &Field,
         column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
-        chain: DecoderMiddlewareChainCursor<'a>,
+        mut chain: DecoderMiddlewareChainCursor<'a>,
     ) -> Result<ChosenFieldScheduler<'a>> {
         let data_type = field.data_type();
         if Self::is_primitive(&data_type) {
             let primitive_col = column_infos.next().unwrap();
+            let needs_dedicated_backpressure = data_type.is_binary_like();
+            let backpressure_id = chain.backpressure_id(needs_dedicated_backpressure);
             let scheduler = self.create_primitive_scheduler(
                 &data_type,
                 chain.current_path(),
                 primitive_col,
                 buffers,
+                backpressure_id,
             )?;
             return Ok((chain, Ok(scheduler)));
         }
@@ -685,11 +702,15 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 // depending on the child data type.
                 if Self::is_primitive(inner.data_type()) {
                     let primitive_col = column_infos.next().unwrap();
+                    let needs_dedicated_backpressure =
+                        inner.data_type().is_binary_like() || inner.data_type().is_nested();
+                    let backpressure_id = chain.backpressure_id(needs_dedicated_backpressure);
                     let scheduler = self.create_primitive_scheduler(
                         &data_type,
                         chain.current_path(),
                         primitive_col,
                         buffers,
+                        backpressure_id,
                     )?;
                     Ok((chain, Ok(scheduler)))
                 } else {
@@ -699,11 +720,13 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
             DataType::Dictionary(_key_type, value_type) => {
                 if Self::is_primitive(value_type) {
                     let primitive_col = column_infos.next().unwrap();
+                    let backpressure_id = chain.backpressure_id(false);
                     let scheduler = self.create_primitive_scheduler(
                         &data_type,
                         chain.current_path(),
                         primitive_col,
                         buffers,
+                        backpressure_id,
                     )?;
                     Ok((chain, Ok(scheduler)))
                 } else {
@@ -719,6 +742,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
             }
             DataType::List(items_field) | DataType::LargeList(items_field) => {
                 let offsets_column = column_infos.next().unwrap();
+                let backpressure_id = chain.backpressure_id(false);
                 Self::ensure_values_encoded(offsets_column, chain.current_path())?;
                 let offsets_column_buffers = ColumnBuffers {
                     file_buffers: buffers,
@@ -766,6 +790,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     Arc::from(inner_infos.into_boxed_slice()),
                     offsets_column_buffers,
                     self.validate_data,
+                    backpressure_id,
                 )) as Arc<dyn FieldScheduler>;
                 let offset_type = if matches!(data_type, DataType::List(_)) {
                     DataType::Int32
@@ -787,12 +812,14 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 let column_info = column_infos.next().unwrap();
 
                 if Self::check_packed_struct(column_info) {
+                    let backpressure_id = chain.backpressure_id(false);
                     // use packed struct encoding
                     let scheduler = self.create_primitive_scheduler(
                         &data_type,
                         chain.current_path(),
                         column_info,
                         buffers,
+                        backpressure_id,
                     )?;
                     Ok((chain, Ok(scheduler)))
                 } else {
@@ -1295,6 +1322,7 @@ pub trait PageScheduler: Send + Sync + std::fmt::Debug {
         ranges: &[Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
+        backpressure_id: u32,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>;
 }
 

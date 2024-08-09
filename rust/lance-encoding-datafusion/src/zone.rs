@@ -212,7 +212,7 @@ impl ZoneMapsFieldScheduler {
                 unloaded_pushdown.position..(unloaded_pushdown.position + unloaded_pushdown.size)
             })
             .collect::<Vec<_>>();
-        let zone_maps_fut = io.submit_request(ranges, 0);
+        let zone_maps_fut = io.submit_request(ranges, 0, 0);
         async move {
             let zone_map_buffers = zone_maps_fut.await?;
             let mut all_fields = Vec::with_capacity(zone_map_buffers.len());

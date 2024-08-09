@@ -13,7 +13,10 @@ impl EncodingsIo for LanceEncodingsIo {
         &self,
         range: Vec<std::ops::Range<u64>>,
         priority: u64,
+        backpressure_id: u32,
     ) -> BoxFuture<'static, lance_core::Result<Vec<bytes::Bytes>>> {
-        self.0.submit_request(range, priority).boxed()
+        self.0
+            .submit_request(range, priority, backpressure_id)
+            .boxed()
     }
 }

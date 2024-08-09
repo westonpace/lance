@@ -104,6 +104,7 @@ const BACKPRESSURE_DEBOUNCE: f64 = 60.0;
 struct BackpressureThrottle {
     semaphore: Semaphore,
     capacity: u64,
+    id: u32,
     start: Instant,
     last_warn: Mutex<f64>,
     deadlock_prevention_timeout: Option<Duration>,
@@ -113,11 +114,13 @@ impl BackpressureThrottle {
     fn new(
         semaphore: Semaphore,
         capacity: u64,
+        id: u32,
         deadlock_prevention_timeout: Option<Duration>,
     ) -> Self {
         Self {
             semaphore,
             capacity,
+            id,
             last_warn: Mutex::new(0_f64),
             start: Instant::now(),
             deadlock_prevention_timeout,
@@ -149,8 +152,9 @@ impl BackpressureThrottle {
             Ok(permit) => {
                 permit.forget();
                 log::trace!(
-                    "Acquired {} permits and now {} remain",
+                    "Acquired {} permits on throttle {} and now {} remain",
                     permits_needed,
+                    self.id,
                     self.semaphore.available_permits(),
                 );
                 return permits_needed;
@@ -169,8 +173,9 @@ impl BackpressureThrottle {
                 Ok(Ok(permit)) => {
                     permit.forget();
                     log::trace!(
-                        "Acquired {} permits and now {} remain",
+                        "Acquired {} permits on throttle {} and now {} remain",
                         permits_needed,
+                        self.id,
                         self.semaphore.available_permits(),
                     );
                     permits_needed
@@ -196,8 +201,9 @@ impl BackpressureThrottle {
                 Ok(permit) => {
                     permit.forget();
                     log::trace!(
-                        "Acquired {} permits and now {} remain",
+                        "Acquired {} permits on throttle {} and now {} remain",
                         permits_needed,
+                        self.id,
                         self.semaphore.available_permits(),
                     );
                     permits_needed
@@ -217,6 +223,7 @@ struct IoTask {
     to_read: Range<u64>,
     when_done: Box<dyn FnOnce((Result<Bytes>, u64)) + Send>,
     permits_to_realease: u64,
+    backpressure_id: u32,
 }
 
 impl IoTask {
@@ -242,12 +249,16 @@ impl IoTask {
 // repeats endlessly until the scheduler is destroyed.
 async fn run_io_loop(
     tasks: async_priority_channel::Receiver<IoTask, Reverse<u128>>,
-    backpressure_throttle: Arc<BackpressureThrottle>,
+    backpressure_throttles: Arc<Mutex<Vec<Arc<BackpressureThrottle>>>>,
     io_capacity: u32,
 ) {
     let mut in_process = FuturesUnordered::new();
 
     let run_task = |mut task: IoTask| async {
+        let backpressure_throttle = {
+            let backpressure_throttles = backpressure_throttles.lock().unwrap();
+            backpressure_throttles[task.backpressure_id as usize].clone()
+        };
         let permits_acquired = backpressure_throttle.acquire_permit(task.num_bytes()).await;
         task.set_permits_to_release(permits_acquired);
         tokio::spawn(task.run())
@@ -292,7 +303,9 @@ pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
     io_submitter: async_priority_channel::Sender<IoTask, Reverse<u128>>,
     file_counter: Mutex<u32>,
-    backpressure_throttle: Arc<BackpressureThrottle>,
+    config: SchedulerConfig,
+    // Backpressure throttles, one per indirection level
+    backpressure_throttles: Arc<Mutex<Vec<Arc<BackpressureThrottle>>>>,
 }
 
 impl Debug for ScanScheduler {
@@ -360,21 +373,32 @@ impl ScanScheduler {
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
         let (reg_tx, reg_rx) = async_priority_channel::unbounded();
         let io_capacity = object_store.io_parallelism().unwrap();
-        let backpressure_throttle = Arc::new(BackpressureThrottle::new(
-            Semaphore::new(config.io_buffer_size_bytes as usize),
-            config.io_buffer_size_bytes,
-            config.deadlock_prevention_timeout,
-        ));
+        let backpressure_throttles = Arc::new(Mutex::new(Vec::new()));
         let scheduler = Self {
             object_store,
             io_submitter: reg_tx,
             file_counter: Mutex::new(0),
-            backpressure_throttle: backpressure_throttle.clone(),
+            config,
+            backpressure_throttles: backpressure_throttles.clone(),
         };
-        tokio::task::spawn(
-            async move { run_io_loop(reg_rx, backpressure_throttle, io_capacity).await },
-        );
+        tokio::task::spawn(async move {
+            run_io_loop(reg_rx, backpressure_throttles, io_capacity).await
+        });
         Arc::new(scheduler)
+    }
+
+    fn get_backpressure_throttle(&self, id: u32) -> Arc<BackpressureThrottle> {
+        let mut backpressure_throttles = self.backpressure_throttles.lock().unwrap();
+        while backpressure_throttles.len() <= id as usize {
+            let new_throttle = Arc::new(BackpressureThrottle::new(
+                Semaphore::new(self.config.io_buffer_size_bytes as usize),
+                self.config.io_buffer_size_bytes,
+                id,
+                self.config.deadlock_prevention_timeout,
+            ));
+            backpressure_throttles.push(new_throttle);
+        }
+        backpressure_throttles[id as usize].clone()
     }
 
     /// Open a file for reading
@@ -398,6 +422,7 @@ impl ScanScheduler {
         request: Vec<Range<u64>>,
         tx: oneshot::Sender<Response>,
         priority: u128,
+        backpressure_id: u32,
     ) {
         let num_iops = request.len() as u32;
 
@@ -418,6 +443,7 @@ impl ScanScheduler {
                 to_read: iop,
                 // This will be set by run_io_loop
                 permits_to_realease: 0,
+                backpressure_id,
                 when_done: Box::new(move |(data, permits_acquired)| {
                     let mut dest = dest.lock().unwrap();
                     let chunk = DataChunk {
@@ -439,12 +465,13 @@ impl ScanScheduler {
         reader: Arc<dyn Reader>,
         request: Vec<Range<u64>>,
         priority: u128,
+        backpressure_id: u32,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
         let (tx, rx) = oneshot::channel::<Response>();
 
-        self.do_submit_request(reader, request, tx, priority);
+        self.do_submit_request(reader, request, tx, priority, backpressure_id);
 
-        let backpressure_throttle = self.backpressure_throttle.clone();
+        let backpressure_throttle = self.get_backpressure_throttle(backpressure_id);
         rx.map(move |wrapped_rsp| {
             // Right now, it isn't possible for I/O to be cancelled so a cancel error should
             // not occur
@@ -453,7 +480,6 @@ impl ScanScheduler {
                 "I/O request completed and releasing {} permits",
                 rsp.permits_acquired
             );
-            log::trace!("{:#?}", std::backtrace::Backtrace::force_capture());
             backpressure_throttle.release(rsp.permits_acquired);
             rsp.data
         })
@@ -483,10 +509,19 @@ impl FileScheduler {
     ///
     /// The requests will be queued in a FIFO manner and, when all requests
     /// have been fulfilled, the returned future will be completed.
+    ///
+    /// Each request has a given priority.  If the I/O loop is full then requests
+    /// will be buffered and requests with the *lowest* priority will be released
+    /// from the buffer first.
+    ///
+    /// Each request has a backpressure ID which controls which backpressure throttle
+    /// is applied to the request.  Requests made to the same backpressure throttle
+    /// will be throttled together.
     pub fn submit_request(
         &self,
         request: Vec<Range<u64>>,
         priority: u64,
+        backpressure_id: u32,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.file_index as u128) << 64) + priority as u128;
@@ -508,9 +543,12 @@ impl FileScheduler {
             updated_requests.push(curr_interval);
         }
 
-        let bytes_vec_fut =
-            self.root
-                .submit_request(self.reader.clone(), updated_requests.clone(), priority);
+        let bytes_vec_fut = self.root.submit_request(
+            self.reader.clone(),
+            updated_requests.clone(),
+            priority,
+            backpressure_id,
+        );
 
         let mut updated_index = 0;
         let mut final_bytes = Vec::with_capacity(request.len());
@@ -546,13 +584,26 @@ impl FileScheduler {
     ///
     /// If you have multpile IOPS to perform then [`Self::submit_request`] is going
     /// to be more efficient.
+    ///
+    /// See [`Self::submit_request`] for more information on the priority and backpressure.
     pub fn submit_single(
         &self,
         range: Range<u64>,
         priority: u64,
+        backpressure_id: u32,
     ) -> impl Future<Output = Result<Bytes>> + Send {
-        self.submit_request(vec![range], priority)
+        self.submit_request(vec![range], priority, backpressure_id)
             .map_ok(|vec_bytes| vec_bytes.into_iter().next().unwrap())
+    }
+
+    /// Submit a single IOP to the reader
+    ///
+    /// The IOP will have priority 0 and backpressure ID 0
+    pub fn submit_out_of_band(
+        &self,
+        range: Range<u64>,
+    ) -> impl Future<Output = Result<Bytes>> + Send {
+        self.submit_single(range, 0, 0)
     }
 
     /// Provides access to the underlying reader
@@ -613,7 +664,7 @@ mod tests {
             reqs.push_back(
                 #[allow(clippy::single_range_in_vec_init)]
                 file_scheduler
-                    .submit_request(vec![offset..offset + READ_SIZE], 0)
+                    .submit_request(vec![offset..offset + READ_SIZE], 0, 0)
                     .await
                     .unwrap(),
             );
@@ -681,14 +732,14 @@ mod tests {
         // Note: the timeout is to prevent a deadlock if the test fails.
         let first_fut = timeout(
             Duration::from_secs(10),
-            file_scheduler.submit_single(0..10, 0),
+            file_scheduler.submit_single(0..10, 0, 0),
         )
         .boxed();
 
         // Issue another low priority request (it will go in queue)
         let mut second_fut = timeout(
             Duration::from_secs(10),
-            file_scheduler.submit_single(0..20, 100),
+            file_scheduler.submit_single(0..20, 100, 0),
         )
         .boxed();
 
@@ -696,7 +747,7 @@ mod tests {
         // the other queued request down)
         let mut third_fut = timeout(
             Duration::from_secs(10),
-            file_scheduler.submit_single(0..30, 0),
+            file_scheduler.submit_single(0..30, 0, 0),
         )
         .boxed();
 
@@ -783,11 +834,11 @@ mod tests {
         };
 
         // This read will begin immediately
-        let first_fut = file_scheduler.submit_single(0..5, 0);
+        let first_fut = file_scheduler.submit_out_of_band(0..5);
         // This read should also begin immediately
-        let second_fut = file_scheduler.submit_single(0..5, 0);
+        let second_fut = file_scheduler.submit_out_of_band(0..5);
         // This read will be throttled
-        let third_fut = file_scheduler.submit_single(0..3, 0);
+        let third_fut = file_scheduler.submit_out_of_band(0..3);
         // Two tasks (third_fut and unit test)
         wait_for_bytes_read_and_idle(10).await;
 
@@ -796,7 +847,7 @@ mod tests {
         wait_for_bytes_read_and_idle(13).await;
 
         // 2 bytes are ready but 5 bytes requested, read will be blocked
-        let fourth_fut = file_scheduler.submit_single(0..5, 0);
+        let fourth_fut = file_scheduler.submit_out_of_band(0..5);
         wait_for_bytes_read_and_idle(13).await;
 
         // Out of order completion is ok, will unblock backpressure
@@ -810,7 +861,7 @@ mod tests {
         //
         // I'm actually not sure this behavior is great.  It's possible that we should just
         // block until we can fulfill the entire request.
-        let fifth_fut = file_scheduler.submit_request(vec![0..3, 90000..90007], 0);
+        let fifth_fut = file_scheduler.submit_request(vec![0..3, 90000..90007], 0, 0);
         wait_for_bytes_read_and_idle(21).await;
 
         // Fifth future should eventually finish due to deadlock prevention
@@ -838,8 +889,8 @@ mod tests {
             .await
             .unwrap();
 
-        let first_fut = file_scheduler.submit_single(0..10, 0);
-        let second_fut = file_scheduler.submit_single(0..10, 0);
+        let first_fut = file_scheduler.submit_out_of_band(0..10);
+        let second_fut = file_scheduler.submit_out_of_band(0..10);
 
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(first_fut.await.unwrap().len(), 10);
@@ -868,7 +919,7 @@ mod tests {
 
         let mut futs = Vec::with_capacity(10000);
         for idx in 0..10000 {
-            futs.push(file_scheduler.submit_single(idx..idx + 1, idx));
+            futs.push(file_scheduler.submit_single(idx..idx + 1, idx, 0));
         }
 
         for fut in futs {

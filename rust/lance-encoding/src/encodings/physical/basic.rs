@@ -116,6 +116,7 @@ impl PageScheduler for BasicPageScheduler {
         ranges: &[std::ops::Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
+        backpressure_id: u32,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let validity_future = match &self.mode {
             SchedulerNullStatus::None(_) | SchedulerNullStatus::All => None,
@@ -123,13 +124,14 @@ impl PageScheduler for BasicPageScheduler {
                 ranges,
                 scheduler,
                 top_level_row,
+                backpressure_id,
             )),
         };
 
         let values_future = if let Some(values_scheduler) = self.mode.values_scheduler() {
             Some(
                 values_scheduler
-                    .schedule_ranges(ranges, scheduler, top_level_row)
+                    .schedule_ranges(ranges, scheduler, top_level_row, backpressure_id)
                     .boxed(),
             )
         } else {

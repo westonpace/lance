@@ -55,6 +55,7 @@ impl PageScheduler for PackedStructPageScheduler {
         ranges: &[std::ops::Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
+        backpressure_id: u32,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let mut total_bytes_per_row: u64 = 0;
 
@@ -78,7 +79,7 @@ impl PageScheduler for PackedStructPageScheduler {
             .collect::<Vec<_>>();
 
         // Directly creates a future to decode the bytes
-        let bytes = scheduler.submit_request(byte_ranges, top_level_row);
+        let bytes = scheduler.submit_request(byte_ranges, top_level_row, backpressure_id);
 
         let copy_struct_fields = self.fields.clone();
 

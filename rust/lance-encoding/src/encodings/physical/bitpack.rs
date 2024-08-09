@@ -306,6 +306,7 @@ impl PageScheduler for BitpackedScheduler {
         ranges: &[std::ops::Range<u64>],
         scheduler: &Arc<dyn crate::EncodingsIo>,
         top_level_row: u64,
+        backpressure_id: u32,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let mut min = u64::MAX;
         let mut max = 0;
@@ -346,7 +347,7 @@ impl PageScheduler for BitpackedScheduler {
             max
         );
 
-        let bytes = scheduler.submit_request(byte_ranges, top_level_row);
+        let bytes = scheduler.submit_request(byte_ranges, top_level_row, backpressure_id);
 
         let bits_per_value = self.bits_per_value;
         let uncompressed_bits_per_value = self.uncompressed_bits_per_value;
