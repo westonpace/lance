@@ -148,6 +148,11 @@ impl BackpressureThrottle {
         match permit {
             Ok(permit) => {
                 permit.forget();
+                log::trace!(
+                    "Acquired {} permits and now {} remain",
+                    permits_needed,
+                    self.semaphore.available_permits(),
+                );
                 return permits_needed;
             }
             Err(TryAcquireError::Closed) => {
@@ -163,6 +168,11 @@ impl BackpressureThrottle {
             match tokio::time::timeout(deadline, wait_for_backpressure).await {
                 Ok(Ok(permit)) => {
                     permit.forget();
+                    log::trace!(
+                        "Acquired {} permits and now {} remain",
+                        permits_needed,
+                        self.semaphore.available_permits(),
+                    );
                     permits_needed
                 }
                 Ok(Err(AcquireError { .. })) => 0,
@@ -185,6 +195,11 @@ impl BackpressureThrottle {
             match wait_for_backpressure.await {
                 Ok(permit) => {
                     permit.forget();
+                    log::trace!(
+                        "Acquired {} permits and now {} remain",
+                        permits_needed,
+                        self.semaphore.available_permits(),
+                    );
                     permits_needed
                 }
                 Err(AcquireError { .. }) => 0,
@@ -214,6 +229,7 @@ impl IoTask {
     }
 
     async fn run(self) {
+        log::trace!("Issuing I/O request for {} bytes", self.num_bytes());
         let bytes_fut = self
             .reader
             .get_range(self.to_read.start as usize..self.to_read.end as usize);
