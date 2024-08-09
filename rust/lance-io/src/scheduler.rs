@@ -147,6 +147,11 @@ impl BackpressureThrottle {
         let permit = self.semaphore.try_acquire_many(permits_needed as u32);
         match permit {
             Ok(permit) => {
+                log::trace!(
+                    "Acquired {} permits ({} remaining)",
+                    permits_needed,
+                    self.semaphore.available_permits()
+                );
                 permit.forget();
                 return permits_needed;
             }
@@ -162,6 +167,11 @@ impl BackpressureThrottle {
         if let Some(deadline) = self.deadlock_prevention_timeout {
             match tokio::time::timeout(deadline, wait_for_backpressure).await {
                 Ok(Ok(permit)) => {
+                    log::trace!(
+                        "Acquired {} permits ({} remaining)",
+                        permits_needed,
+                        self.semaphore.available_permits()
+                    );
                     permit.forget();
                     permits_needed
                 }
@@ -184,6 +194,11 @@ impl BackpressureThrottle {
         } else {
             match wait_for_backpressure.await {
                 Ok(permit) => {
+                    log::trace!(
+                        "Acquired {} permits ({} remaining)",
+                        permits_needed,
+                        self.semaphore.available_permits()
+                    );
                     permit.forget();
                     permits_needed
                 }
