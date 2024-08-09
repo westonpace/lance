@@ -137,7 +137,11 @@ impl BackpressureThrottle {
     async fn acquire_permit(&self, num_bytes: u64) -> u64 {
         // First, try and acquire the permit without waiting
         let permits_needed = num_bytes.min(self.capacity).min(u32::MAX as u64);
-        log::trace!("Attempting to acquire {} permits", permits_needed);
+        log::trace!(
+            "Attempting to acquire {} permits to load {} bytes",
+            permits_needed,
+            num_bytes
+        );
         if permits_needed < num_bytes {
             log::warn!(
                 "I/O request for {} bytes exceeds the I/O buffer size of {}",
