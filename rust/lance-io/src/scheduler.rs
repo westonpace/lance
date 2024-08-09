@@ -137,6 +137,7 @@ impl BackpressureThrottle {
     async fn acquire_permit(&self, num_bytes: u64) -> u64 {
         // First, try and acquire the permit without waiting
         let permits_needed = num_bytes.min(self.capacity).min(u32::MAX as u64);
+        log::trace!("Attempting to acquire {} permits", permits_needed);
         if permits_needed < num_bytes {
             log::warn!(
                 "I/O request for {} bytes exceeds the I/O buffer size of {}",
@@ -244,6 +245,7 @@ async fn run_io_loop(
     backpressure_throttle: Arc<BackpressureThrottle>,
     io_capacity: u32,
 ) {
+    log::trace!("Starting io loop");
     let mut in_process = FuturesUnordered::new();
 
     // First, prime the queue up to io_capacity
@@ -252,6 +254,7 @@ async fn run_io_loop(
         match next_task {
             Ok(task) => {
                 let mut task = task.0;
+                log::trace!("About to acquire permits");
                 let permits_acquired = backpressure_throttle.acquire_permit(task.num_bytes()).await;
                 task.set_permits_to_release(permits_acquired);
                 let handle = tokio::spawn(task.run());
