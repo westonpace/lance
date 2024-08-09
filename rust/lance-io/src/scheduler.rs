@@ -234,7 +234,11 @@ impl IoTask {
     }
 
     async fn run(self) {
-        log::trace!("Issuing I/O request for {} bytes", self.num_bytes());
+        log::trace!(
+            "Issuing I/O request for {} bytes and {} permits to release",
+            self.num_bytes(),
+            self.permits_to_realease
+        );
         let bytes_fut = self
             .reader
             .get_range(self.to_read.start as usize..self.to_read.end as usize);
@@ -262,6 +266,7 @@ async fn run_io_loop(
                 log::trace!("About to acquire permits");
                 let permits_acquired = backpressure_throttle.acquire_permit(task.num_bytes()).await;
                 task.set_permits_to_release(permits_acquired);
+                log::trace!("Spawning I/O task with {} bytes", task.num_bytes());
                 let handle = tokio::spawn(task.run());
                 in_process.push(handle);
             }
