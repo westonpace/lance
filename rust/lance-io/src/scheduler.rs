@@ -449,6 +449,11 @@ impl ScanScheduler {
             // Right now, it isn't possible for I/O to be cancelled so a cancel error should
             // not occur
             let rsp = wrapped_rsp.unwrap();
+            log::trace!(
+                "I/O request completed and releasing {} permits",
+                rsp.permits_acquired
+            );
+            log::trace!("{:#?}", std::backtrace::Backtrace::force_capture());
             backpressure_throttle.release(rsp.permits_acquired);
             rsp.data
         })
