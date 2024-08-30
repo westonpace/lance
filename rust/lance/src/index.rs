@@ -160,6 +160,7 @@ impl IndexInformationProvider for ScalarIndexInfo {
 
 #[tracing::instrument(skip_all)]
 async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
+    dbg!(std::backtrace::Backtrace::force_capture());
     let file_size = reader.size().await?;
     let tail_bytes = read_last_block(reader).await?;
     let metadata_pos = read_metadata_offset(&tail_bytes)?;
