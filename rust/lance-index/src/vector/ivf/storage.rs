@@ -126,6 +126,7 @@ impl IvfModel {
     }
 
     pub async fn load(reader: &FileReader) -> Result<Self> {
+        dbg!(std::backtrace::Backtrace::force_capture());
         let schema = reader.schema();
         let meta_str = schema.metadata.get(IVF_METADATA_KEY).ok_or(Error::Index {
             message: format!("{} not found during search", IVF_METADATA_KEY),

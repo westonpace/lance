@@ -158,6 +158,7 @@ impl IndexInformationProvider for ScalarIndexInfo {
     }
 }
 
+#[tracing::instrument(skip_all)]
 async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
     let file_size = reader.size().await?;
     let tail_bytes = read_last_block(reader).await?;
