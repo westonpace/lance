@@ -20,7 +20,7 @@ from lance import (
 )
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter
-from lance.fragment import write_fragments
+from lance.fragment import plan_alignment, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
 
@@ -354,3 +354,31 @@ def test_create_from_file(tmp_path):
     assert dataset.count_rows() == 1600
     assert len(dataset.get_fragments()) == 1
     assert dataset.get_fragments()[0].fragment_id == 2
+
+
+def test_alignment(tmp_path):
+    data = pa.table({"a": range(800), "b": range(800)})
+    dataset = lance.write_dataset(
+        data,
+        tmp_path,
+        max_rows_per_file=100,
+    )
+
+    new_data = pa.table({"c": range(800), "d": range(800)})
+
+    input_uri = tmp_path / "data" / f"{uuid.uuid4()}.lance"
+    with LanceFileWriter(input_uri) as writer:
+        writer.write_batch(new_data)
+
+    tasks = plan_alignment(dataset, [input_uri])
+    print(tasks)
+
+    fragments = []
+    fragments_and_schemas = [task.execute() for task in tasks]
+    fragments = [frag for frag, _ in fragments_and_schemas]
+    schema = fragments_and_schemas[0][1]
+
+    op = lance.LanceOperation.Merge(fragments, schema)
+    ds = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+
+    print(ds.to_table())

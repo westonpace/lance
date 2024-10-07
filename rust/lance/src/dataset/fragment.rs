@@ -483,6 +483,117 @@ impl FileFragment {
         }
     }
 
+    pub async fn with_new_data_file(
+        &self,
+        filename: &str,
+        target_field_ids: Vec<i32>,
+    ) -> Result<(Fragment, Schema)> {
+        let filepath = self.dataset.data_dir().child(filename);
+        let file_version =
+            determine_file_version(self.dataset.object_store.as_ref(), &filepath, None).await?;
+
+        if file_version
+            != self
+                .dataset
+                .manifest
+                .data_storage_format
+                .lance_file_version()?
+        {
+            return Err(Error::io(
+                format!(
+                    "File version mismatch. Dataset verison: {:?} Fragment version: {:?}",
+                    self.dataset
+                        .manifest
+                        .data_storage_format
+                        .lance_file_version()?,
+                    file_version
+                ),
+                location!(),
+            ));
+        }
+
+        if file_version == LanceFileVersion::Legacy {
+            return Err(Error::io(
+                "with_new_data_file is not supported on legacy data files".to_string(),
+                location!(),
+            ));
+        }
+
+        // Load the file metadata, use the schema and incoming field ids to determine
+        // the column offsets and field ids of the new data file
+        let scheduler = ScanScheduler::new(
+            self.dataset.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+        );
+        let file_scheduler = scheduler.open_file(&filepath).await?;
+        let reader = v2::reader::FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderMiddlewareChain>::default(),
+            &self.dataset.session.file_metadata_cache,
+        )
+        .await?;
+        let metadata = reader.metadata();
+
+        let projection = v2::reader::ReaderProjection::from_whole_schema(&metadata.file_schema);
+        let physical_rows = metadata.num_rows as usize;
+        // Can unwrap here since we've already determined this is a >= 2.0 file which implies a manifest
+        // version new enough to contain physical_rows
+        if physical_rows != self.metadata.physical_rows.unwrap() {
+            return Err(Error::io(
+                format!(
+                    "Physical rows mismatch. Expected: {} Got: {}",
+                    self.metadata.physical_rows.unwrap(),
+                    physical_rows
+                ),
+                location!(),
+            ));
+        }
+
+        if target_field_ids.len() != projection.column_indices.len() {
+            return Err(Error::io(
+                format!(
+                    "Field ids length mismatch. Expected: {} Got: {}",
+                    projection.column_indices.len(),
+                    target_field_ids.len()
+                ),
+                location!(),
+            ));
+        }
+
+        let mut next_field_id = self.dataset.manifest.max_field_id() + 1;
+
+        let mut field_ids = Vec::with_capacity(target_field_ids.len());
+
+        for target_id in target_field_ids {
+            if target_id < 0 {
+                let target_id = next_field_id;
+                next_field_id += 1;
+                field_ids.push(target_id);
+            } else {
+                field_ids.push(target_id);
+            }
+        }
+
+        let column_indices = projection
+            .column_indices
+            .into_iter()
+            .map(|c| c as i32)
+            .collect();
+
+        let mut fragment = self.metadata.clone();
+        fragment.add_file(filename, field_ids, column_indices, &file_version);
+
+        let mut new_schema = self
+            .dataset
+            .manifest
+            .schema
+            .merge(metadata.file_schema.as_ref())?;
+        new_schema.set_field_id(Some(self.dataset.manifest.max_field_id()));
+
+        Ok((fragment, new_schema))
+    }
+
     pub fn dataset(&self) -> &Dataset {
         self.dataset.as_ref()
     }

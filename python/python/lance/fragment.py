@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 import warnings
 from pathlib import Path
 from typing import (
@@ -24,6 +25,7 @@ import pyarrow as pa
 
 from .dependencies import _check_for_pandas
 from .dependencies import pandas as pd
+from .file import LanceFileReader, LanceFileWriter
 from .lance import _Fragment, _write_fragments
 from .lance import _FragmentMetadata as _FragmentMetadata
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
@@ -83,6 +85,10 @@ class FragmentMetadata:
     @property
     def id(self) -> int:
         return self._metadata.id
+
+    def with_id(self, new_id: Optional[int]) -> FragmentMetadata:
+        """Replaces the id of the fragment with the given id."""
+        return FragmentMetadata.from_metadata(self._metadata.with_id(new_id))
 
 
 class LanceFragment(pa.dataset.Fragment):
@@ -241,6 +247,12 @@ class LanceFragment(pa.dataset.Fragment):
             storage_options=storage_options,
         )
         return FragmentMetadata(inner_meta.json())
+
+    def with_new_data_file(
+        self, filename: str, target_field_ids: List[int]
+    ) -> Tuple[FragmentMetadata, LanceSchema]:
+        fragment, schema = self._fragment.with_new_data_file(filename, target_field_ids)
+        return FragmentMetadata.from_metadata(fragment), schema
 
     @property
     def fragment_id(self):
@@ -621,3 +633,207 @@ def write_fragments(
         storage_options=storage_options,
     )
     return [FragmentMetadata.from_metadata(frag) for frag in fragments]
+
+
+class CombineInputsTask:
+    def __init__(
+        self,
+        dataset_uri: str,
+        input_uris: List[str],
+        rows_to_skip: int,
+        num_rows: int,
+        fragment_id: int,
+    ):
+        self._dataset_uri = dataset_uri
+        self._input_uris = input_uris
+        self._rows_to_skip = rows_to_skip
+        self._num_rows = num_rows
+        self._fragment_id = fragment_id
+
+    def execute(
+        self,
+        *,
+        batch_size: Optional[int] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+    ) -> Tuple[FragmentMetadata, LanceSchema]:
+        """
+        Combines ``num_rows`` rows from the given input files (starting from the first
+        and advancing in order) into a new fragment with the given fragment ID.
+
+        Fragments on the end may be skipped or only partially included if ``num_rows``
+        does not span all the given fragments.  If ``num_rows`` is greater than the
+        total number of rows in the given fragments, an error will be raised.
+
+        This will read all data from the given input files and write them into a new
+        fragment. The new fragment will have a new path (UUID) and will have the
+        given fragment ID.
+
+        This is an internal operation.
+
+        This operation is only supported with v2 files.
+        """
+        if len(self._input_uris) == 0:
+            raise ValueError("No fragments to combine")
+
+        schema = LanceFileReader(self._input_uris[0]).metadata().schema
+
+        def scan_fragments():
+            rows_remaining = self._num_rows
+            skip_remaining = self._rows_to_skip
+            print(
+                f"Scanning files to write fragment with {rows_remaining} rows and skipping {skip_remaining} rows of input"
+            )
+            for input_uri in self._input_uris:
+                reader = LanceFileReader(input_uri)
+                print(f"Starting on file with {reader.metadata().num_rows} rows")
+                try:
+                    if schema != reader.metadata().schema:
+                        print("Schema mismatch")
+                        raise ValueError("Input schemas do not match")
+                    for batch in reader.read_all(batch_size=batch_size).to_batches():
+                        print(f"Batch arrived with {batch.num_rows} rows")
+                        if skip_remaining > 0:
+                            if batch.num_rows <= skip_remaining:
+                                print(
+                                    f"Fully skipping batch since skip_remaining={skip_remaining}"
+                                )
+                                skip_remaining -= batch.num_rows
+                                continue
+                            batch = batch.slice(
+                                skip_remaining, batch.num_rows - skip_remaining
+                            )
+                            print(f"Proceeding with {batch.num_rows} rows after skip")
+                            skip_remaining = 0
+                        if batch.num_rows > rows_remaining:
+                            batch = batch.slice(0, rows_remaining)
+                            rows_remaining = 0
+                        else:
+                            rows_remaining -= batch.num_rows
+                        yield batch
+                        if rows_remaining == 0:
+                            print("Bailing early since rows_remaining=0")
+                            return
+                    print("Bailing naturally since fully scanned input file")
+                except Exception as e:
+                    print(e)
+                    raise e
+            if rows_remaining == 0:
+                raise ValueError("Not enough rows in the input files to combine")
+
+        filename = f"{uuid.uuid4()}.lance"
+        with LanceFileWriter(f"{self._dataset_uri}/data/{filename}") as writer:
+            for batch in scan_fragments():
+                writer.write_batch(batch)
+
+        from lance import LanceDataset
+
+        ds = LanceDataset(self._dataset_uri)
+        frag = ds.get_fragment(self._fragment_id)
+
+        return frag.with_new_data_file(filename, [-1 for _ in range(len(schema))])
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "input_uris": self._input_uris,
+                "dataset_uri": self._dataset_uri,
+                "rows_to_skip": self._rows_to_skip,
+                "num_rows": self._num_rows,
+                "fragment_id": self._fragment_id,
+            }
+        )
+
+    @staticmethod
+    def from_json(json_data: str) -> CombineInputsTask:
+        data = json.loads(json_data)
+        return CombineInputsTask(
+            data["dataset_uri"],
+            data["input_uris"],
+            data["rows_to_skip"],
+            data["num_rows"],
+            data["fragment_id"],
+        )
+
+    def __reduce__(self):
+        return (CombineInputsTask.from_json, (self.to_json(),))
+
+
+def plan_alignment(
+    dataset: LanceDataset, input_uris: List[str]
+) -> List[CombineInputsTask]:
+    """
+    Plan the alignment of input files into fragments
+
+    Given an ordered list of input URIs this will create tasks to convert
+    the Lance files into a new list of fragments.  Each fragment in the new list will
+    correspond to one fragment in the dataset, with the same fragment ID and the same
+    number of rows.
+
+    This is an internal operation that will prepare for a merge operation to add a new
+    column to the dataset.
+    """
+    target_frags = dataset.get_fragments()
+    if len(target_frags) == 0:
+        raise ValueError("Dataset has no fragments")
+
+    target_frag_iter = iter(target_frags)
+
+    def next_target():
+        current_target = next(target_frag_iter, None)
+        if current_target is None:
+            print("Finished with targets")
+            return -1, -1
+        else:
+            print(f"Processing target with {current_target.physical_rows} rows")
+            return current_target.fragment_id, current_target.physical_rows
+
+    target_id, rows_in_target = next_target()
+    rows_remaining = rows_in_target
+
+    def count_rows(input_uri):
+        return LanceFileReader(input_uri).metadata().num_rows
+
+    tasks = []
+    input_files = []
+    rows_to_skip = 0
+    for input_uri in input_uris:
+        rows_in_input = LanceFileReader(input_uri).metadata().num_rows
+        print(f"Processing input with {rows_in_input} rows")
+        remaining_in_input = rows_in_input
+        while remaining_in_input > 0:
+            if target_id < 0:
+                raise ValueError(
+                    "More rows in input files than there are in dataset fragments"
+                )
+            input_files.append(input_uri)
+            if remaining_in_input != rows_in_input:
+                rows_to_skip = rows_in_input - remaining_in_input
+            if remaining_in_input >= rows_remaining:
+                tasks.append(
+                    CombineInputsTask(
+                        dataset.uri,
+                        input_files,
+                        rows_to_skip,
+                        rows_in_target,
+                        target_id,
+                    )
+                )
+                print(
+                    f"Creating task with {len(input_files)} input files skip={rows_to_skip} num_rows={rows_in_target}"
+                )
+                input_files = []
+                remaining_in_input -= rows_remaining
+
+                target_id, rows_in_target = next_target()
+                rows_remaining = rows_in_target
+            else:
+                print("Finished input without creating new task")
+                rows_remaining -= rows_in_input
+                remaining_in_input = 0
+    try:
+        next(target_frag_iter)
+        raise ValueError("More rows in dataset fragments than there are in input files")
+    except StopIteration:
+        pass
+
+    return tasks

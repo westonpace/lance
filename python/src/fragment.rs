@@ -21,12 +21,15 @@ use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
+use lance::datatypes::Schema;
 use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance_table::io::deletion::deletion_file_path;
 use pyo3::prelude::*;
 use pyo3::{exceptions::*, pyclass::CompareOp, types::PyDict};
 
 use crate::dataset::get_write_params;
+use crate::error::PythonErrorExt;
+use crate::schema::LanceSchema;
 use crate::updater::Updater;
 use crate::{Dataset, Scanner, RT};
 
@@ -267,6 +270,20 @@ impl FileFragment {
         RT.block_on(None, self.fragment.physical_rows())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
+
+    fn with_new_data_file(
+        &self,
+        filename: &str,
+        target_field_ids: Vec<i32>,
+    ) -> PyResult<(FragmentMetadata, LanceSchema)> {
+        let (new_metadata, schema) = RT
+            .block_on(
+                None,
+                self.fragment.with_new_data_file(filename, target_field_ids),
+            )?
+            .infer_error()?;
+        Ok((FragmentMetadata::new(new_metadata), LanceSchema(schema)))
+    }
 }
 
 impl From<FileFragment> for LanceFragment {
@@ -419,6 +436,12 @@ impl FragmentMetadata {
     #[getter]
     fn id(&self) -> u64 {
         self.inner.id
+    }
+
+    fn with_id(&self, new_id: Option<u64>) -> Self {
+        let mut new_inner = self.inner.clone();
+        new_inner.id = new_id.unwrap_or(0);
+        Self { inner: new_inner }
     }
 }
 

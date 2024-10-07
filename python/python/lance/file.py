@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+from pathlib import Path
 from typing import Dict, Optional, Union
 
 import pyarrow as pa
@@ -55,7 +56,9 @@ class LanceFileReader:
     """
 
     # TODO: make schema optional
-    def __init__(self, path: str, storage_options: Optional[Dict[str, str]] = None):
+    def __init__(
+        self, path: Union[str, Path], storage_options: Optional[Dict[str, str]] = None
+    ):
         """
         Creates a new file reader to read the given file
 
@@ -69,9 +72,13 @@ class LanceFileReader:
             Extra options to be used for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
         """
+        if isinstance(path, Path):
+            path = str(path)
         self._reader = _LanceFileReader(path, storage_options=storage_options)
 
-    def read_all(self, *, batch_size: int = 1024, batch_readahead=16) -> ReaderResults:
+    def read_all(
+        self, *, batch_size: Optional[int] = None, batch_readahead=16
+    ) -> ReaderResults:
         """
         Reads the entire file
 
@@ -84,10 +91,17 @@ class LanceFileReader:
             Smaller batches will use less memory but might be slightly
             slower because there is more per-batch overhead
         """
+        if batch_size is None:
+            batch_size = 1024
         return ReaderResults(self._reader.read_all(batch_size, batch_readahead))
 
     def read_range(
-        self, start: int, num_rows: int, *, batch_size: int = 1024, batch_readahead=16
+        self,
+        start: int,
+        num_rows: int,
+        *,
+        batch_size: Optional[int] = None,
+        batch_readahead=16,
     ) -> ReaderResults:
         """
         Read a range of rows from the file
@@ -105,12 +119,14 @@ class LanceFileReader:
             Smaller batches will use less memory but might be slightly
             slower because there is more per-batch overhead
         """
+        if batch_size is None:
+            batch_size = 1024
         return ReaderResults(
             self._reader.read_range(start, num_rows, batch_size, batch_readahead)
         )
 
     def take_rows(
-        self, indices, *, batch_size: int = 1024, batch_readahead=16
+        self, indices, *, batch_size: Optional[int] = None, batch_readahead=16
     ) -> ReaderResults:
         """
         Read a specific set of rows from the file
@@ -126,6 +142,8 @@ class LanceFileReader:
             Smaller batches will use less memory but might be slightly
             slower because there is more per-batch overhead
         """
+        if batch_size is None:
+            batch_size = 1024
         for i in range(len(indices) - 1):
             if indices[i] > indices[i + 1]:
                 raise ValueError(
@@ -171,7 +189,7 @@ class LanceFileWriter:
 
     def __init__(
         self,
-        path: str,
+        path: Union[str, Path],
         schema: Optional[pa.Schema] = None,
         *,
         data_cache_bytes: Optional[int] = None,
@@ -202,6 +220,9 @@ class LanceFileWriter:
             Extra options to be used for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
         """
+        if isinstance(path, Path):
+            path = str(path)
+
         self._writer = _LanceFileWriter(
             path,
             schema,
