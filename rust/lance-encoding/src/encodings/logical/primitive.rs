@@ -24,7 +24,10 @@ use snafu::{location, Location};
 use crate::data::{AllNullDataBlock, DataBlock, VariableWidthBlock};
 use crate::decoder::PerValueDecompressor;
 use crate::encoder::PerValueDataBlock;
-use crate::repdef::{build_control_word_iterator, ControlWordIterator, ControlWordParser};
+use crate::repdef::{
+    build_control_word_iterator, CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser,
+    DefinitionInterpretation,
+};
 use crate::statistics::{ComputeStat, GetStat, Stat};
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
@@ -294,6 +297,7 @@ struct DecodeMiniBlockTask {
     def_decompressor: Arc<dyn BlockDecompressor>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
     dictionary_data: Option<Arc<DataBlock>>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
     // The mini-blocks to decode
     //
     // For each mini-block we also have the ranges of rows that we want to decode
@@ -363,6 +367,64 @@ impl DecodeMiniBlockTask {
             levels.extend(iter::repeat(0).take(num_values));
         }
     }
+
+    /// If there is no repetition information this just returns the range as-is.
+    ///
+    /// If there is repetition information then we need to do some work to figure out what
+    /// range of items corresponds to the requested range of rows.
+    ///
+    /// For example, if the data is [[1, 2, 3], [4, 5], [6, 7]] and the range is 1..2 (i.e. just row
+    /// 1) then the user actually wants items 3..5.  In the above case the rep levels would be:
+    ///
+    /// Idx: 0 1 2 3 4 5 6
+    /// Rep: 1 0 0 1 0 1 0
+    ///
+    /// So the start (1) maps to the second 1 (idx=3) and the end (2) maps to the third 1 (idx=5)
+    fn map_range(range: Range<u64>, rep: Option<&impl AsRef<[u16]>>, max_rows: u64) -> Range<u64> {
+        if let Some(rep) = rep {
+            let rep = rep.as_ref();
+            // levels to figure out what range of items corresponds to that range of rows
+
+            // The first item is always the start of a new list (i.e. the maximum possible rep level)
+            let max_rep = *rep.first().unwrap();
+            let mut rows_seen = 0;
+            let mut new_start = 0;
+
+            // Empty ranges will break the below code and we shouldn't be getting them anyways (but if
+            // we need to handle them in the future it's actually not that hard)
+            assert!(range.start < range.end);
+
+            // 0 always maps to 0, otherwise we need to walk
+            if range.start > 0 {
+                for (idx, rep) in rep.iter().enumerate() {
+                    if *rep == max_rep {
+                        if rows_seen == range.start {
+                            new_start = idx as u64;
+                            break;
+                        }
+                        rows_seen += 1;
+                    }
+                }
+            }
+            let mut new_end = rep.len() as u64;
+            // max_rows always maps to rep.len(), otherwise we need to walk
+            if range.end < max_rows {
+                for (idx, rep) in rep[(new_start + 1) as usize..].iter().enumerate() {
+                    if *rep == max_rep {
+                        if rows_seen == range.end {
+                            new_end = idx as u64 + new_start;
+                            break;
+                        }
+                        rows_seen += 1;
+                    }
+                }
+            }
+            new_start..new_end
+        } else {
+            // No repetition info, easy case, just use the range as-is
+            range
+        }
+    }
 }
 
 impl DecodePageTask for DecodeMiniBlockTask {
@@ -429,36 +491,39 @@ impl DecodePageTask for DecodeMiniBlockTask {
             //
             // In this case we want to take the values 450..500 and 600..650 from the block.
             let mut offset = to_skip;
-            for range in chunk.ranges {
-                if to_skip > range.end - range.start {
-                    to_skip -= range.end - range.start;
+            for row_range in chunk.ranges {
+                if to_skip > row_range.end - row_range.start {
+                    to_skip -= row_range.end - row_range.start;
                     continue;
                 }
+
                 // Subtract skip from start of range
-                let range = range.start + to_skip..range.end;
+                let row_range = row_range.start + to_skip..row_range.end;
                 to_skip = 0;
 
                 // Truncate range to fit remaining
-                let range_len = range.end - range.start;
-                let to_take = range_len.min(remaining);
-                let range = range.start..range.start + to_take;
+                let rows_in_range = row_range.end - row_range.start;
+                let to_take = rows_in_range.min(remaining);
+                let row_range = row_range.start..row_range.start + to_take;
+
+                let item_range = Self::map_range(row_range, rep.as_ref(), chunk.vals_in_chunk);
 
                 // Grab values and add to what we are building
                 Self::extend_levels(
                     offset as usize,
-                    range.clone(),
+                    item_range.clone(),
                     &mut repbuf,
                     &rep,
                     level_offset,
                 );
                 Self::extend_levels(
                     offset as usize,
-                    range.clone(),
+                    item_range.clone(),
                     &mut defbuf,
                     &def,
                     level_offset,
                 );
-                data_builder.append(&values, range);
+                data_builder.append(&values, item_range);
                 remaining -= to_take;
                 offset += to_take;
                 level_offset += to_take as usize;
@@ -467,6 +532,8 @@ impl DecodePageTask for DecodeMiniBlockTask {
         debug_assert_eq!(remaining, 0);
 
         let data = data_builder.finish();
+
+        let unraveler = RepDefUnraveler::new(repbuf, defbuf, self.def_meaning.clone());
 
         // if dictionary encoding is applied, do dictionary decode here.
         if let Some(dictionary) = &self.dictionary_data {
@@ -496,8 +563,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
 
         Ok(DecodedPage {
             data,
-            repetition: repbuf,
-            definition: defbuf,
+            repdef: unraveler,
         })
     }
 }
@@ -509,6 +575,7 @@ struct MiniBlockDecoder {
     rep_decompressor: Arc<dyn BlockDecompressor>,
     def_decompressor: Arc<dyn BlockDecompressor>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
     data: VecDeque<ScheduledChunk>,
     offset_in_current_chunk: u64,
     num_rows: u64,
@@ -545,6 +612,7 @@ impl StructuralPageDecoder for MiniBlockDecoder {
             dictionary_data: self.dictionary.clone(),
             num_rows,
             offset_into_first_chunk,
+            def_meaning: self.def_meaning.clone(),
         }))
     }
 
@@ -586,12 +654,16 @@ struct SimpleAllNullDecodePageTask {
 }
 impl DecodePageTask for SimpleAllNullDecodePageTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        let unraveler = RepDefUnraveler::new(
+            None,
+            Some(vec![1; self.num_values as usize]),
+            Arc::new([DefinitionInterpretation::NullableItem]),
+        );
         Ok(DecodedPage {
             data: DataBlock::AllNull(AllNullDataBlock {
                 num_values: self.num_values,
             }),
-            repetition: None,
-            definition: Some(vec![1; self.num_values as usize]),
+            repdef: unraveler,
         })
     }
 }
@@ -636,7 +708,7 @@ pub struct MiniBlockScheduler {
     rep_decompressor: Arc<dyn BlockDecompressor>,
     def_decompressor: Arc<dyn BlockDecompressor>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
-
+    def_meaning: Arc<[DefinitionInterpretation]>,
     // This is set after initialization
     chunk_meta: Vec<ChunkMeta>,
 
@@ -658,6 +730,11 @@ impl MiniBlockScheduler {
             decompressors.create_block_decompressor(layout.rep_compression.as_ref().unwrap())?;
         let def_decompressor =
             decompressors.create_block_decompressor(layout.def_compression.as_ref().unwrap())?;
+        let def_meaning = layout
+            .layers
+            .iter()
+            .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+            .collect::<Vec<_>>();
         let value_decompressor = decompressors
             .create_miniblock_decompressor(layout.value_compression.as_ref().unwrap())?;
         let dictionary = if let Some(dictionary_encoding) = layout.dictionary.as_ref() {
@@ -699,6 +776,7 @@ impl MiniBlockScheduler {
             rows_in_page,
             chunk_meta: Vec::new(),
             dictionary,
+            def_meaning: def_meaning.into(),
         })
     }
 
@@ -880,6 +958,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .dictionary
             .as_ref()
             .map(|dictionary| dictionary.dictionary_data.clone());
+        let def_meaning = self.def_meaning.clone();
 
         for scheduled_chunk in scheduled_chunks.iter_mut() {
             scheduled_chunk.vals_targeted =
@@ -895,6 +974,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 rep_decompressor,
                 def_decompressor,
                 value_decompressor,
+                def_meaning,
                 data: scheduled_chunks,
                 offset_in_current_chunk: 0,
                 num_rows,
@@ -1079,10 +1159,16 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 data_builder.append(&decompressed, 0..rows_in_buf);
             }
 
+            let unraveler = RepDefUnraveler::new(
+                None,
+                None,
+                // TODO: Fix this
+                Arc::new([DefinitionInterpretation::NullableItem]),
+            );
+
             Ok(DecodedPage {
                 data: data_builder.finish(),
-                repetition: None,
-                definition: None,
+                repdef: unraveler,
             })
         } else {
             // Slow path, unzipping needed
@@ -1116,10 +1202,16 @@ impl DecodePageTask for FixedFullZipDecodeTask {
             let repetition = if rep.is_empty() { None } else { Some(rep) };
             let definition = if def.is_empty() { None } else { Some(def) };
 
-            Ok(DecodedPage {
-                data: data_builder.finish(),
+            let unraveler = RepDefUnraveler::new(
                 repetition,
                 definition,
+                // TODO: Fix this
+                Arc::new([DefinitionInterpretation::NullableItem]),
+            );
+
+            Ok(DecodedPage {
+                data: data_builder.finish(),
+                repdef: unraveler,
             })
         }
     }
@@ -1498,7 +1590,6 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
 #[derive(Debug)]
 pub struct StructuralCompositeDecodeArrayTask {
     tasks: Vec<Box<dyn DecodePageTask>>,
-    num_values: u64,
     data_type: DataType,
     should_validate: bool,
 }
@@ -1506,27 +1597,10 @@ pub struct StructuralCompositeDecodeArrayTask {
 impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
         let mut arrays = Vec::with_capacity(self.tasks.len());
-        let mut all_rep = LevelBuffer::with_capacity(self.num_values as usize);
-        let mut all_def = LevelBuffer::with_capacity(self.num_values as usize);
-        let mut offset = 0;
-        let mut has_def = false;
+        let mut unravelers = Vec::with_capacity(self.tasks.len());
         for task in self.tasks {
             let decoded = task.decode()?;
-
-            if let Some(rep) = &decoded.repetition {
-                // Note: if one chunk has repetition, all chunks will have repetition
-                // and so all_rep will either end up with len=num_values or len=0
-                all_rep.extend(rep);
-            }
-            if let Some(def) = &decoded.definition {
-                if !has_def {
-                    // This is the first validity we have seen, need to backfill with all-valid
-                    // if we've processed any all-valid pages
-                    has_def = true;
-                    all_def.extend(iter::repeat(0).take(offset));
-                }
-                all_def.extend(def);
-            }
+            unravelers.push(decoded.repdef);
 
             let array = make_array(
                 decoded
@@ -1534,25 +1608,14 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
                     .into_arrow(self.data_type.clone(), self.should_validate)?,
             );
 
-            offset += array.len();
             arrays.push(array);
         }
         let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
         let array = arrow_select::concat::concat(&array_refs)?;
-        let all_rep = if all_rep.is_empty() {
-            None
-        } else {
-            Some(all_rep)
-        };
-        let all_def = if all_def.is_empty() {
-            None
-        } else {
-            Some(all_def)
-        };
-        let mut repdef = RepDefUnraveler::new(all_rep, all_def);
+        let mut repdef = CompositeRepDefUnraveler::new(unravelers);
 
         // The primitive array itself has a validity
-        let mut validity = repdef.unravel_validity();
+        let mut validity = repdef.unravel_validity(array.len());
         if matches!(self.data_type, DataType::Null) {
             // Null arrays don't have a validity but we still pretend they do for consistency's sake
             // up until this point.  We need to remove it here.
@@ -1623,7 +1686,6 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
             tasks,
             data_type: self.field.data_type().clone(),
             should_validate: self.should_validate,
-            num_values: num_rows,
         }))
     }
 
@@ -2190,6 +2252,19 @@ impl PrimitiveStructuralEncoder {
                 row_number,
             })
         }
+        let description = ProtobufUtils::miniblock_layout(
+            rep_encoding,
+            def_encoding,
+            value_encoding,
+            &repdef.def_meaning,
+        );
+        Ok(EncodedPage {
+            num_rows: num_values,
+            column_idx,
+            data: vec![block_meta_buffer, block_value_buffer],
+            description: PageEncoding::Structural(description),
+            row_number,
+        })
     }
 
     // For fixed-size data we encode < control word | data > for each value

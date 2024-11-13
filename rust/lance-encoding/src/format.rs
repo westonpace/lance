@@ -24,7 +24,9 @@ use pb::{
     MiniBlockLayout, Nullable, PackedStruct, PageLayout,
 };
 
-use crate::encodings::physical::block_compress::CompressionConfig;
+use crate::{
+    encodings::physical::block_compress::CompressionConfig, repdef::DefinitionInterpretation,
+};
 
 use self::pb::Constant;
 
@@ -229,18 +231,50 @@ impl ProtobufUtils {
         }
     }
 
+    fn def_inter_to_repdef_layer(def: DefinitionInterpretation) -> i32 {
+        match def {
+            DefinitionInterpretation::AllValid => RepDefLayer::RepdefAllValid as i32,
+            DefinitionInterpretation::NullableItem => RepDefLayer::RepdefNullableItem as i32,
+            DefinitionInterpretation::NullableList => RepDefLayer::RepdefNullableList as i32,
+            DefinitionInterpretation::EmptyableList => RepDefLayer::RepdefEmptyableList as i32,
+            DefinitionInterpretation::NullableAndEmptyableList => {
+                RepDefLayer::RepdefNullAndEmptyList as i32
+            }
+        }
+    }
+
+    pub fn repdef_layer_to_def_interp(layer: i32) -> DefinitionInterpretation {
+        let layer = RepDefLayer::try_from(layer).unwrap();
+        match layer {
+            RepDefLayer::RepdefAllValid => DefinitionInterpretation::AllValid,
+            RepDefLayer::RepdefNullableItem => DefinitionInterpretation::NullableItem,
+            RepDefLayer::RepdefNullableList => DefinitionInterpretation::NullableList,
+            RepDefLayer::RepdefEmptyableList => DefinitionInterpretation::EmptyableList,
+            RepDefLayer::RepdefNullAndEmptyList => {
+                DefinitionInterpretation::NullableAndEmptyableList
+            }
+            RepDefLayer::RepdefUnspecified => panic!("Unspecified repdef layer"),
+        }
+    }
+
     pub fn miniblock_layout(
         rep_encoding: ArrayEncoding,
         def_encoding: ArrayEncoding,
         value_encoding: ArrayEncoding,
         dictionary_encoding: Option<ArrayEncoding>,
+        def_meaning: &[DefinitionInterpretation],
     ) -> PageLayout {
+        assert!(!def_meaning.is_empty());
         PageLayout {
             layout: Some(Layout::MiniBlockLayout(MiniBlockLayout {
                 def_compression: Some(def_encoding),
                 rep_compression: Some(rep_encoding),
                 value_compression: Some(value_encoding),
                 dictionary: dictionary_encoding,
+                layers: def_meaning
+                    .iter()
+                    .map(|&def| Self::def_inter_to_repdef_layer(def))
+                    .collect(),
             })),
         }
     }

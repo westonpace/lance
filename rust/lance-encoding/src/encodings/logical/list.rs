@@ -22,9 +22,11 @@ use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::{
-        DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
-        LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding, PriorityRange,
-        ScheduledScanLine, SchedulerContext, SchedulingJob,
+        DecodeArrayTask, DecodeBatchScheduler, DecodedArray, FieldScheduler, FilterExpression,
+        ListPriorityRange, LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding,
+        PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
+        StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
+        StructuralSchedulingJob,
     },
     encoder::{
         ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder,
@@ -1249,6 +1251,189 @@ impl FieldEncoder for ListFieldEncoder {
     }
 }
 
+/// A structural encoder for list fields
+///
+/// The list's offsets are added to the rep/def builder and the items are passed to the child.
+pub struct ListStructuralEncoder {
+    child: Box<dyn FieldEncoder>,
+}
+
+impl ListStructuralEncoder {
+    pub fn new(child: Box<dyn FieldEncoder>) -> Self {
+        Self { child }
+    }
+}
+
+impl FieldEncoder for ListStructuralEncoder {
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
+        mut repdef: RepDefBuilder,
+        row_number: u64,
+    ) -> Result<Vec<EncodeTask>> {
+        if let Some(list_arr) = array.as_list_opt::<i32>() {
+            repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned());
+            self.child.maybe_encode(
+                list_arr.values().clone(),
+                external_buffers,
+                repdef,
+                row_number,
+            )
+        } else if let Some(list_arr) = array.as_list_opt::<i64>() {
+            repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned());
+            self.child.maybe_encode(
+                list_arr.values().clone(),
+                external_buffers,
+                repdef,
+                row_number,
+            )
+        } else {
+            panic!("List encoder used for non-list data")
+        }
+    }
+
+    fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
+        self.child.flush(external_buffers)
+    }
+
+    fn num_columns(&self) -> u32 {
+        self.child.num_columns()
+    }
+
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+        self.child.finish(external_buffers)
+    }
+}
+
+#[derive(Debug)]
+pub struct StructuralListScheduler {
+    child: Box<dyn StructuralFieldScheduler>,
+}
+
+impl StructuralListScheduler {
+    pub fn new(child: Box<dyn StructuralFieldScheduler>) -> Self {
+        Self { child }
+    }
+}
+
+impl StructuralFieldScheduler for StructuralListScheduler {
+    fn schedule_ranges<'a>(
+        &'a self,
+        ranges: &[Range<u64>],
+        filter: &FilterExpression,
+    ) -> Result<Box<dyn StructuralSchedulingJob + 'a>> {
+        let child = self.child.schedule_ranges(ranges, filter)?;
+
+        Ok(Box::new(StructuralListSchedulingJob::new(child)))
+    }
+
+    fn initialize<'a>(
+        &'a mut self,
+        filter: &'a FilterExpression,
+        context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        self.child.initialize(filter, context)
+    }
+}
+
+/// Scheduling job for list data
+///
+/// It doesn't really do anything right now because list
+#[derive(Debug)]
+struct StructuralListSchedulingJob<'a> {
+    child: Box<dyn StructuralSchedulingJob + 'a>,
+}
+
+impl<'a> StructuralListSchedulingJob<'a> {
+    fn new(child: Box<dyn StructuralSchedulingJob + 'a>) -> Self {
+        Self { child }
+    }
+}
+
+impl<'a> StructuralSchedulingJob for StructuralListSchedulingJob<'a> {
+    fn schedule_next(
+        &mut self,
+        context: &mut SchedulerContext,
+    ) -> Result<Option<ScheduledScanLine>> {
+        self.child.schedule_next(context)
+    }
+}
+
+#[derive(Debug)]
+pub struct StructuralListDecoder {
+    child: Box<dyn StructuralFieldDecoder>,
+    data_type: DataType,
+}
+
+impl StructuralListDecoder {
+    pub fn new(child: Box<dyn StructuralFieldDecoder>, data_type: DataType) -> Self {
+        Self { child, data_type }
+    }
+}
+
+impl StructuralFieldDecoder for StructuralListDecoder {
+    fn accept_page(&mut self, child: crate::decoder::LoadedPage) -> Result<()> {
+        self.child.accept_page(child)
+    }
+
+    fn drain(&mut self, num_rows: u64) -> Result<Box<dyn StructuralDecodeArrayTask>> {
+        let child_task = self.child.drain(num_rows)?;
+        Ok(Box::new(StructuralListDecodeTask::new(
+            child_task,
+            self.data_type.clone(),
+        )))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+}
+
+#[derive(Debug)]
+struct StructuralListDecodeTask {
+    child_task: Box<dyn StructuralDecodeArrayTask>,
+    data_type: DataType,
+}
+
+impl StructuralListDecodeTask {
+    fn new(child_task: Box<dyn StructuralDecodeArrayTask>, data_type: DataType) -> Self {
+        Self {
+            child_task,
+            data_type,
+        }
+    }
+}
+
+impl StructuralDecodeArrayTask for StructuralListDecodeTask {
+    fn decode(self: Box<Self>) -> Result<DecodedArray> {
+        let DecodedArray { array, mut repdef } = self.child_task.decode()?;
+        match &self.data_type {
+            DataType::List(child_field) => {
+                let (offsets, validity) = repdef.unravel_offsets::<i32>()?;
+                let list_array = ListArray::try_new(child_field.clone(), offsets, array, validity)?;
+                Ok(DecodedArray {
+                    array: Arc::new(list_array),
+                    repdef,
+                })
+            }
+            DataType::LargeList(child_field) => {
+                let (offsets, validity) = repdef.unravel_offsets::<i64>()?;
+                let list_array =
+                    LargeListArray::try_new(child_field.clone(), offsets, array, validity)?;
+                Ok(DecodedArray {
+                    array: Arc::new(list_array),
+                    repdef,
+                })
+            }
+            _ => panic!("List decoder did not have a list field"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1261,6 +1446,7 @@ mod tests {
     };
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
+    use rstest::rstest;
 
     use crate::{
         testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
@@ -1275,10 +1461,13 @@ mod tests {
         DataType::LargeList(Arc::new(Field::new("item", inner_type, true)))
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_list() {
+    async fn test_list(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let field = Field::new("", make_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_round_trip_encoding_random(field, version).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1332,8 +1521,11 @@ mod tests {
         .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_simple_list() {
+    async fn test_simple_list(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let items_builder = Int32Builder::new();
         let mut list_builder = ListBuilder::new(items_builder);
         list_builder.append_value([Some(1), Some(2), Some(3)]);
@@ -1346,7 +1538,8 @@ mod tests {
             .with_range(0..2)
             .with_range(0..3)
             .with_range(1..3)
-            .with_indices(vec![1, 3]);
+            .with_indices(vec![1, 3])
+            .with_file_version(version);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
     }

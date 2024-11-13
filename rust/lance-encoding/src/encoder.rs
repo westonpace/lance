@@ -20,6 +20,7 @@ use crate::buffer::LanceBuffer;
 use crate::data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock};
 use crate::decoder::PageEncoding;
 use crate::encodings::logical::blob::BlobFieldEncoder;
+use crate::encodings::logical::list::ListStructuralEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
@@ -1204,8 +1205,15 @@ impl FieldEncodingStrategy for StructuralEncodingStrategy {
             )?))
         } else {
             match data_type {
-                DataType::List(_child) | DataType::LargeList(_child) => {
-                    todo!()
+                DataType::List(_) | DataType::LargeList(_) => {
+                    let child = field.children.first().expect("List should have a child");
+                    let child_encoder = self.create_field_encoder(
+                        _encoding_strategy_root,
+                        child,
+                        column_index,
+                        options,
+                    )?;
+                    Ok(Box::new(ListStructuralEncoder::new(child_encoder)))
                 }
                 DataType::Struct(_) => {
                     let field_metadata = &field.metadata;
