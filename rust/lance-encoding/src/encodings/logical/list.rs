@@ -1414,6 +1414,8 @@ impl StructuralDecodeArrayTask for StructuralListDecodeTask {
         match &self.data_type {
             DataType::List(child_field) => {
                 let (offsets, validity) = repdef.unravel_offsets::<i32>()?;
+                println!("List offsets: {:?}", offsets);
+                println!("List validity: {:?}", validity);
                 let list_array = ListArray::try_new(child_field.clone(), offsets, array, validity)?;
                 Ok(DecodedArray {
                     array: Arc::new(list_array),

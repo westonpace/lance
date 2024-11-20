@@ -26,7 +26,7 @@ use crate::decoder::PerValueDecompressor;
 use crate::encoder::PerValueDataBlock;
 use crate::repdef::{
     build_control_word_iterator, CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser,
-    DefinitionInterpretation,
+    DefinitionInterpretation, RepDefSlicer,
 };
 use crate::statistics::{ComputeStat, GetStat, Stat};
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
@@ -298,6 +298,7 @@ struct DecodeMiniBlockTask {
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
     dictionary_data: Option<Arc<DataBlock>>,
     def_meaning: Arc<[DefinitionInterpretation]>,
+    max_visible_level: u16,
     // The mini-blocks to decode
     //
     // For each mini-block we also have the ranges of rows that we want to decode
@@ -380,7 +381,13 @@ impl DecodeMiniBlockTask {
     /// Rep: 1 0 0 1 0 1 0
     ///
     /// So the start (1) maps to the second 1 (idx=3) and the end (2) maps to the third 1 (idx=5)
-    fn map_range(range: Range<u64>, rep: Option<&impl AsRef<[u16]>>, max_rows: u64) -> Range<u64> {
+    fn map_range(
+        range: Range<u64>,
+        rep: Option<&impl AsRef<[u16]>>,
+        def: Option<&impl AsRef<[u16]>>,
+        max_visible_def: u16,
+        max_rows: u64,
+    ) -> Range<u64> {
         if let Some(rep) = rep {
             let rep = rep.as_ref();
             // levels to figure out what range of items corresponds to that range of rows
@@ -394,32 +401,85 @@ impl DecodeMiniBlockTask {
             // we need to handle them in the future it's actually not that hard)
             assert!(range.start < range.end);
 
-            // 0 always maps to 0, otherwise we need to walk
-            if range.start > 0 {
-                for (idx, rep) in rep.iter().enumerate() {
-                    if *rep == max_rep {
-                        if rows_seen == range.start {
-                            new_start = idx as u64;
-                            break;
+            if let Some(def) = def {
+                let def = def.as_ref();
+                // 0 always maps to 0 (even with invis items), otherwise we need to walk
+                let mut invis_seen = 0;
+                let mut new_start_is_visible = false;
+                if range.start > 0 {
+                    for (idx, rep) in rep.iter().enumerate() {
+                        if *rep == max_rep {
+                            if rows_seen == range.start {
+                                new_start = idx as u64 - invis_seen;
+                                new_start_is_visible = def[idx] <= max_visible_def;
+                                break;
+                            }
+                            rows_seen += 1;
+                            if def[idx] > max_visible_def {
+                                invis_seen += 1;
+                            }
                         }
-                        rows_seen += 1;
                     }
+                } else {
+                    new_start_is_visible = def[0] <= max_visible_def;
                 }
-            }
-            let mut new_end = rep.len() as u64;
-            // max_rows always maps to rep.len(), otherwise we need to walk
-            if range.end < max_rows {
+                let mut new_end = rep.len() as u64;
+                invis_seen = if new_start_is_visible { 0 } else { 1 };
                 for (idx, rep) in rep[(new_start + 1) as usize..].iter().enumerate() {
                     if *rep == max_rep {
                         if rows_seen == range.end {
-                            new_end = idx as u64 + new_start;
+                            new_end = idx as u64 + new_start - invis_seen;
                             break;
                         }
                         rows_seen += 1;
+                        if def[idx] > max_visible_def {
+                            invis_seen += 1;
+                        }
                     }
                 }
+                println!(
+                    "Mapped row range {:?} to {:?} using rep {:?}",
+                    range,
+                    new_start..new_end,
+                    rep
+                );
+                new_start..new_end
+            } else {
+                // Easy case, there are no invisible items, so we don't need to check for them
+
+                // 0 always maps to 0, otherwise we need to walk
+                if range.start > 0 {
+                    for (idx, rep) in rep.iter().enumerate() {
+                        if *rep == max_rep {
+                            if rows_seen == range.start {
+                                new_start = idx as u64;
+                                break;
+                            }
+                            rows_seen += 1;
+                        }
+                    }
+                }
+                let mut new_end = rep.len() as u64;
+                // max_rows always maps to rep.len(), otherwise we need to walk
+                if range.end < max_rows {
+                    for (idx, rep) in rep[(new_start + 1) as usize..].iter().enumerate() {
+                        if *rep == max_rep {
+                            if rows_seen == range.end {
+                                new_end = idx as u64 + new_start;
+                                break;
+                            }
+                            rows_seen += 1;
+                        }
+                    }
+                }
+                println!(
+                    "Mapped row range (no max def) {:?} to {:?} using rep {:?}",
+                    range,
+                    new_start..new_end,
+                    rep
+                );
+                new_start..new_end
             }
-            new_start..new_end
         } else {
             // No repetition info, easy case, just use the range as-is
             range
@@ -429,6 +489,7 @@ impl DecodeMiniBlockTask {
 
 impl DecodePageTask for DecodeMiniBlockTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        println!("Decoding: {:?}", self);
         // First, we create output buffers for the rep and def and data
         let mut repbuf: Option<LevelBuffer> = None;
         let mut defbuf: Option<LevelBuffer> = None;
@@ -479,6 +540,9 @@ impl DecodePageTask for DecodeMiniBlockTask {
             let rep = Self::decode_levels(rep_decompressor.as_ref(), LanceBuffer::Borrowed(rep))?;
             let def = Self::decode_levels(def_decompressor.as_ref(), LanceBuffer::Borrowed(def))?;
 
+            println!("Rep: {:?}", rep.as_ref().map(|r| r.as_ref()));
+            println!("Def: {:?}", def.as_ref().map(|d| d.as_ref()));
+
             // We've decoded the entire block.  Now we need to factor in:
             // - The offset into the first chunk
             // - The ranges the user asked for
@@ -506,7 +570,13 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 let to_take = rows_in_range.min(remaining);
                 let row_range = row_range.start..row_range.start + to_take;
 
-                let item_range = Self::map_range(row_range, rep.as_ref(), chunk.vals_in_chunk);
+                let item_range = Self::map_range(
+                    row_range,
+                    rep.as_ref(),
+                    def.as_ref(),
+                    self.max_visible_level,
+                    chunk.vals_in_chunk,
+                );
 
                 // Grab values and add to what we are building
                 Self::extend_levels(
@@ -524,6 +594,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
                     level_offset,
                 );
                 data_builder.append(&values, item_range);
+                println!("Appending range {:?} from {:?}", item_range, values);
                 remaining -= to_take;
                 offset += to_take;
                 level_offset += to_take as usize;
@@ -604,6 +675,12 @@ impl StructuralPageDecoder for MiniBlockDecoder {
                 chunks.push(chunk);
             }
         }
+        let max_visible_level = self
+            .def_meaning
+            .iter()
+            .take_while(|l| !l.is_list())
+            .map(|l| l.num_def_levels())
+            .sum::<u16>();
         Ok(Box::new(DecodeMiniBlockTask {
             chunks,
             rep_decompressor: self.rep_decompressor.clone(),
@@ -613,6 +690,7 @@ impl StructuralPageDecoder for MiniBlockDecoder {
             num_rows,
             offset_into_first_chunk,
             def_meaning: self.def_meaning.clone(),
+            max_visible_level,
         }))
     }
 
@@ -998,6 +1076,7 @@ pub struct FullZipScheduler {
     priority: u64,
     rows_in_page: u64,
     value_decompressor: Arc<dyn PerValueDecompressor>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
     ctrl_word_parser: ControlWordParser,
 }
 
@@ -1019,9 +1098,15 @@ impl FullZipScheduler {
             layout.bits_rep.try_into().unwrap(),
             layout.bits_def.try_into().unwrap(),
         );
+        let def_meaning = layout
+            .layers
+            .iter()
+            .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+            .collect::<Vec<_>>();
         Ok(Self {
             data_buf_position,
             value_decompressor: value_decompressor.into(),
+            def_meaning: def_meaning.into(),
             priority,
             rows_in_page,
             ctrl_word_parser,
@@ -1053,6 +1138,7 @@ impl StructuralPageScheduler for FullZipScheduler {
         });
         let data = io.submit_request(byte_ranges.collect(), self.priority);
         let value_decompressor = self.value_decompressor.clone();
+        let def_meaning = self.def_meaning.clone();
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
         let ctrl_word_parser = self.ctrl_word_parser;
         Ok(async move {
@@ -1063,6 +1149,7 @@ impl StructuralPageScheduler for FullZipScheduler {
                 .collect();
             Ok(Box::new(FixedFullZipDecoder {
                 value_decompressor,
+                def_meaning,
                 data,
                 num_rows,
                 ctrl_word_parser,
@@ -1085,6 +1172,7 @@ impl StructuralPageScheduler for FullZipScheduler {
 #[derive(Debug)]
 struct FixedFullZipDecoder {
     value_decompressor: Arc<dyn PerValueDecompressor>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
     ctrl_word_parser: ControlWordParser,
     data: VecDeque<LanceBuffer>,
     offset_in_current: usize,
@@ -1120,6 +1208,7 @@ impl StructuralPageDecoder for FixedFullZipDecoder {
         let num_rows = task_data.iter().map(|td| td.1).sum::<u64>() as usize;
         Ok(Box::new(FixedFullZipDecodeTask {
             value_decompressor: self.value_decompressor.clone(),
+            def_meaning: self.def_meaning.clone(),
             ctrl_word_parser: self.ctrl_word_parser,
             data: task_data,
             bytes_per_value: self.bytes_per_value,
@@ -1137,6 +1226,7 @@ impl StructuralPageDecoder for FixedFullZipDecoder {
 #[derive(Debug)]
 struct FixedFullZipDecodeTask {
     value_decompressor: Arc<dyn PerValueDecompressor>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
     ctrl_word_parser: ControlWordParser,
     data: Vec<(LanceBuffer, u64)>,
     num_rows: usize,
@@ -1159,12 +1249,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 data_builder.append(&decompressed, 0..rows_in_buf);
             }
 
-            let unraveler = RepDefUnraveler::new(
-                None,
-                None,
-                // TODO: Fix this
-                Arc::new([DefinitionInterpretation::NullableItem]),
-            );
+            let unraveler = RepDefUnraveler::new(None, None, self.def_meaning);
 
             Ok(DecodedPage {
                 data: data_builder.finish(),
@@ -1206,7 +1291,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 repetition,
                 definition,
                 // TODO: Fix this
-                Arc::new([DefinitionInterpretation::NullableItem]),
+                self.def_meaning,
             );
 
             Ok(DecodedPage {
@@ -2110,19 +2195,19 @@ impl PrimitiveStructuralEncoder {
     ///
     /// TODO: Use bit-packing here
     fn compress_levels(
-        levels: Option<LevelBuffer>,
+        levels: Option<RepDefSlicer<'_>>,
         num_values: u64,
         compression_strategy: &dyn CompressionStrategy,
         chunks: &[MiniBlockChunk],
     ) -> Result<(Vec<LanceBuffer>, pb::ArrayEncoding)> {
-        if let Some(levels) = levels {
-            debug_assert_eq!(num_values as usize, levels.len());
+        if let Some(mut levels) = levels {
             // Make the levels into a FixedWidth data block
-            let mut levels_buf = LanceBuffer::reinterpret_vec(levels);
+            let num_levels = levels.num_levels() as u64;
+            let mut levels_buf = levels.all_levels().try_clone().unwrap();
             let levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
                 data: levels_buf.borrow_and_clone(),
                 bits_per_value: 16,
-                num_values,
+                num_values: num_levels,
                 block_info: BlockInfo::new(),
             });
             let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
@@ -2131,21 +2216,25 @@ impl PrimitiveStructuralEncoder {
                 compression_strategy.create_block_compressor(&levels_field, &levels_block)?;
             // Compress blocks of levels (sized according to the chunks)
             let mut buffers = Vec::with_capacity(chunks.len());
-            let mut off = 0;
             let mut values_counter = 0;
             for chunk in chunks {
                 let chunk_num_values = chunk.num_values(values_counter, num_values);
                 values_counter += chunk_num_values;
-                let level_bytes = chunk_num_values as usize * 2;
-                let chunk_levels = levels_buf.slice_with_length(off, level_bytes);
+                let chunk_levels = levels.slice_next(chunk_num_values as usize);
+                let num_chunk_levels = (chunk_levels.len() / 2) as u64;
+                println!(
+                    "For {} values we need {} levels ({} bytes)",
+                    chunk_num_values,
+                    num_chunk_levels,
+                    chunk_levels.len()
+                );
                 let chunk_levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
                     data: chunk_levels,
                     bits_per_value: 16,
-                    num_values: chunk_num_values,
+                    num_values: num_chunk_levels,
                     block_info: BlockInfo::new(),
                 });
                 let compressed_levels = compressor.compress(chunk_levels_block)?;
-                off += level_bytes;
                 buffers.push(compressed_levels);
             }
             Ok((buffers, compressor_desc))
@@ -2183,7 +2272,9 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         dictionary_data: Option<DataBlock>,
     ) -> Result<EncodedPage> {
+        println!("Serializing: {:?}", repdefs);
         let repdef = RepDefBuilder::serialize(repdefs);
+        println!("Serialized: {:?}", repdef);
 
         if let DataBlock::AllNull(_null_block) = data {
             // If we got here then all the data is null but we have rep/def information that
@@ -2199,14 +2290,14 @@ impl PrimitiveStructuralEncoder {
         let (compressed_data, value_encoding) = compressor.compress(data)?;
 
         let (compressed_rep, rep_encoding) = Self::compress_levels(
-            repdef.repetition_levels,
+            repdef.rep_slicer(),
             num_values,
             compression_strategy,
             &compressed_data.chunks,
         )?;
 
         let (compressed_def, def_encoding) = Self::compress_levels(
-            repdef.definition_levels,
+            repdef.def_slicer(),
             num_values,
             compression_strategy,
             &compressed_data.chunks,
@@ -2364,10 +2455,11 @@ impl PrimitiveStructuralEncoder {
             .definition_levels
             .as_ref()
             .map_or(0, |d| d.iter().max().copied().unwrap_or(0));
+
         let repdef_iter = build_control_word_iterator(
-            repdef.repetition_levels,
+            repdef.repetition_levels.as_deref(),
             max_rep,
-            repdef.definition_levels,
+            repdef.definition_levels.as_deref(),
             max_def,
         );
         let bits_rep = repdef_iter.bits_rep();
@@ -2382,7 +2474,8 @@ impl PrimitiveStructuralEncoder {
 
         let zipped = Self::serialize_full_zip(compressed_data, repdef_iter);
 
-        let description = ProtobufUtils::full_zip_layout(bits_rep, bits_def, value_encoding);
+        let description =
+            ProtobufUtils::full_zip_layout(bits_rep, bits_def, value_encoding, &repdef.def_meaning);
         Ok(EncodedPage {
             num_rows: num_values,
             column_idx,

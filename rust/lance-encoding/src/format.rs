@@ -233,7 +233,8 @@ impl ProtobufUtils {
 
     fn def_inter_to_repdef_layer(def: DefinitionInterpretation) -> i32 {
         match def {
-            DefinitionInterpretation::AllValid => RepDefLayer::RepdefAllValid as i32,
+            DefinitionInterpretation::AllValidItem => RepDefLayer::RepdefAllValidItem as i32,
+            DefinitionInterpretation::AllValidList => RepDefLayer::RepdefAllValidList as i32,
             DefinitionInterpretation::NullableItem => RepDefLayer::RepdefNullableItem as i32,
             DefinitionInterpretation::NullableList => RepDefLayer::RepdefNullableList as i32,
             DefinitionInterpretation::EmptyableList => RepDefLayer::RepdefEmptyableList as i32,
@@ -246,7 +247,8 @@ impl ProtobufUtils {
     pub fn repdef_layer_to_def_interp(layer: i32) -> DefinitionInterpretation {
         let layer = RepDefLayer::try_from(layer).unwrap();
         match layer {
-            RepDefLayer::RepdefAllValid => DefinitionInterpretation::AllValid,
+            RepDefLayer::RepdefAllValidItem => DefinitionInterpretation::AllValidItem,
+            RepDefLayer::RepdefAllValidList => DefinitionInterpretation::AllValidList,
             RepDefLayer::RepdefNullableItem => DefinitionInterpretation::NullableItem,
             RepDefLayer::RepdefNullableList => DefinitionInterpretation::NullableList,
             RepDefLayer::RepdefEmptyableList => DefinitionInterpretation::EmptyableList,
@@ -283,12 +285,17 @@ impl ProtobufUtils {
         bits_rep: u8,
         bits_def: u8,
         value_encoding: ArrayEncoding,
+        def_meaning: &[DefinitionInterpretation],
     ) -> PageLayout {
         PageLayout {
             layout: Some(Layout::FullZipLayout(pb::FullZipLayout {
                 bits_rep: bits_rep as u32,
                 bits_def: bits_def as u32,
                 value_compression: Some(value_encoding),
+                layers: def_meaning
+                    .iter()
+                    .map(|&def| Self::def_inter_to_repdef_layer(def))
+                    .collect(),
             })),
         }
     }

@@ -92,7 +92,10 @@
 // This means we end up with 3 bits per level instead of 2.  We could instead record
 // the layers that are all null somewhere else and not require wider rep levels.
 
-use std::{iter::Zip, sync::Arc};
+use std::{
+    iter::{Copied, Zip},
+    sync::Arc,
+};
 
 use arrow_array::OffsetSizeTrait;
 use arrow_buffer::{
@@ -100,6 +103,8 @@ use arrow_buffer::{
 };
 use lance_core::{utils::bit::log_2_ceil, Error, Result};
 use snafu::{location, Location};
+
+use crate::buffer::LanceBuffer;
 
 // We assume 16 bits is good enough for rep-def levels.  This gives us
 // 65536 levels of struct nesting and list nesting.
@@ -151,11 +156,11 @@ pub struct SerializedRepDefs {
     /// The repetition levels, one per item
     ///
     /// If None, there are no lists
-    pub repetition_levels: Option<LevelBuffer>,
+    pub repetition_levels: Option<Arc<[u16]>>,
     /// The definition levels, one per item
     ///
     /// If None, there are no nulls
-    pub definition_levels: Option<LevelBuffer>,
+    pub definition_levels: Option<Arc<[u16]>>,
     /// Special records indicate empty / null lists
     ///
     /// These do not have any mapping to items.  There may be empty or there may
@@ -163,9 +168,39 @@ pub struct SerializedRepDefs {
     pub special_records: Vec<SpecialRecord>,
     /// The meaning of each definition level
     pub def_meaning: Vec<DefinitionInterpretation>,
+    /// The maximum level that is "visible" from the lowest level
+    ///
+    /// This is the last level before we encounter a list level of some kind.  Once we've
+    /// hit a list level then nulls in any level beyond do not map to actual items.
+    ///
+    /// This is None if there are no lists
+    pub max_visible_level: Option<u16>,
 }
 
 impl SerializedRepDefs {
+    pub fn new(
+        repetition_levels: Option<LevelBuffer>,
+        definition_levels: Option<LevelBuffer>,
+        special_records: Vec<SpecialRecord>,
+        def_meaning: Vec<DefinitionInterpretation>,
+    ) -> Self {
+        let first_list = def_meaning.iter().position(|level| level.is_list());
+        let max_visible_level = first_list.map(|first_list| {
+            def_meaning
+                .iter()
+                .map(|level| level.num_def_levels())
+                .take(first_list)
+                .sum::<u16>()
+        });
+        Self {
+            repetition_levels: repetition_levels.map(Arc::from),
+            definition_levels: definition_levels.map(Arc::from),
+            special_records,
+            def_meaning,
+            max_visible_level,
+        }
+    }
+
     /// Creates an empty SerializedRepDefs (no repetition, all valid)
     pub fn empty(def_meaning: Vec<DefinitionInterpretation>) -> Self {
         Self {
@@ -173,7 +208,20 @@ impl SerializedRepDefs {
             definition_levels: None,
             special_records: Vec::new(),
             def_meaning,
+            max_visible_level: None,
         }
+    }
+
+    pub fn rep_slicer(&self) -> Option<RepDefSlicer> {
+        self.repetition_levels
+            .as_ref()
+            .map(|rep| RepDefSlicer::new(self, rep.clone()))
+    }
+
+    pub fn def_slicer(&self) -> Option<RepDefSlicer> {
+        self.definition_levels
+            .as_ref()
+            .map(|def| RepDefSlicer::new(self, def.clone()))
     }
 
     /// Creates a version of the SerializedRepDefs with the specials collapsed into
@@ -210,25 +258,25 @@ impl SerializedRepDefs {
                     } else {
                         let rep = if let Some(last_special) = last_special {
                             let rep = *last_special;
-                            *last_special = rep_itr.next().unwrap();
+                            *last_special = *rep_itr.next().unwrap();
                             rep
                         } else {
-                            rep_itr.next().unwrap()
+                            *rep_itr.next().unwrap()
                         };
                         new_rep.push(rep);
-                        new_def.push(def_itr.next().unwrap());
+                        new_def.push(*def_itr.next().unwrap());
                         last_special = None;
                     }
                 } else {
                     let rep = if let Some(last_special) = last_special {
                         let rep = *last_special;
-                        *last_special = rep_itr.next().unwrap();
+                        *last_special = *rep_itr.next().unwrap();
                         rep
                     } else {
-                        rep_itr.next().unwrap()
+                        *rep_itr.next().unwrap()
                     };
                     new_rep.push(rep);
-                    new_def.push(def_itr.next().unwrap());
+                    new_def.push(*def_itr.next().unwrap());
                     last_special = None;
                 }
             }
@@ -247,10 +295,10 @@ impl SerializedRepDefs {
                     } else {
                         let rep = if let Some(last_special) = last_special {
                             let rep = *last_special;
-                            *last_special = rep_itr.next().unwrap();
+                            *last_special = *rep_itr.next().unwrap();
                             rep
                         } else {
-                            rep_itr.next().unwrap()
+                            *rep_itr.next().unwrap()
                         };
                         new_rep.push(rep);
                         new_def.push(0);
@@ -259,10 +307,10 @@ impl SerializedRepDefs {
                 } else {
                     let rep = if let Some(last_special) = last_special {
                         let rep = *last_special;
-                        *last_special = rep_itr.next().unwrap();
+                        *last_special = *rep_itr.next().unwrap();
                         rep
                     } else {
-                        rep_itr.next().unwrap()
+                        *rep_itr.next().unwrap()
                     };
                     new_rep.push(rep);
                     new_def.push(0);
@@ -272,10 +320,65 @@ impl SerializedRepDefs {
         }
 
         Self {
-            repetition_levels: Some(new_rep),
-            definition_levels: Some(new_def),
+            repetition_levels: Some(new_rep.into()),
+            definition_levels: Some(new_def.into()),
             special_records: Vec::new(),
             def_meaning: self.def_meaning,
+            max_visible_level: self.max_visible_level,
+        }
+    }
+}
+
+pub struct RepDefSlicer<'a> {
+    repdef: &'a SerializedRepDefs,
+    to_slice: LanceBuffer,
+    current: usize,
+}
+
+impl<'a> RepDefSlicer<'a> {
+    fn new(repdef: &'a SerializedRepDefs, levels: Arc<[u16]>) -> Self {
+        Self {
+            repdef,
+            to_slice: LanceBuffer::reinterpret_slice(levels),
+            current: 0,
+        }
+    }
+
+    pub fn num_levels(&self) -> usize {
+        self.to_slice.len()
+    }
+
+    pub fn all_levels(&self) -> &LanceBuffer {
+        &self.to_slice
+    }
+
+    pub fn slice_next(&mut self, num_values: usize) -> LanceBuffer {
+        let start = self.current;
+        let Some(max_visible_level) = self.repdef.max_visible_level else {
+            // No lists, should be 1:1 mapping from levels to values
+            self.current = start + num_values;
+            return self.to_slice.slice_with_length(start * 2, num_values * 2);
+        };
+        if let Some(def) = self.repdef.definition_levels.as_ref() {
+            // There are lists and there are def levels.  That means there may be
+            // more rep/def levels than values.  We need to scan the def levels to figure
+            // out which items are "invisible" and skip over them
+            let mut def_itr = def[start..].iter();
+            let mut num_taken = 0;
+            let mut num_passed = 0;
+            while num_taken < num_values {
+                let def_level = *def_itr.next().unwrap();
+                if def_level <= max_visible_level {
+                    num_taken += 1;
+                }
+                num_passed += 1;
+            }
+            self.current = start + num_passed;
+            self.to_slice.slice_with_length(start * 2, num_passed * 2)
+        } else {
+            // No def levels, should be 1:1 mapping from levels to values
+            self.current = start + num_values;
+            self.to_slice.slice_with_length(start * 2, num_values * 2)
         }
     }
 }
@@ -308,11 +411,39 @@ pub struct SpecialRecord {
 /// Indicates if a definition level represents a null value or an empty list
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DefinitionInterpretation {
-    AllValid,
+    AllValidItem,
+    AllValidList,
     NullableItem,
     NullableList,
     EmptyableList,
     NullableAndEmptyableList,
+}
+
+impl DefinitionInterpretation {
+    pub fn num_def_levels(&self) -> u16 {
+        match self {
+            Self::AllValidItem => 0,
+            Self::AllValidList => 0,
+            Self::NullableItem => 1,
+            Self::NullableList => 1,
+            Self::EmptyableList => 1,
+            Self::NullableAndEmptyableList => 2,
+        }
+    }
+
+    pub fn is_all_valid(&self) -> bool {
+        matches!(self, Self::AllValidItem | Self::AllValidList)
+    }
+
+    pub fn is_list(&self) -> bool {
+        matches!(
+            self,
+            Self::AllValidList
+                | Self::NullableList
+                | Self::EmptyableList
+                | Self::NullableAndEmptyableList
+        )
+    }
 }
 
 /// The RepDefBuilder is used to collect offsets & validity buffers
@@ -385,15 +516,7 @@ impl SerializerContext {
 
     fn checkout_def(&mut self, meaning: DefinitionInterpretation) -> u16 {
         let def = self.current_def;
-        match meaning {
-            DefinitionInterpretation::NullableAndEmptyableList => {
-                self.current_def += 2;
-            }
-            DefinitionInterpretation::AllValid => {}
-            _ => {
-                self.current_def += 1;
-            }
-        }
+        self.current_def += meaning.num_def_levels();
         self.def_meaning.push(meaning);
         def
     }
@@ -413,7 +536,7 @@ impl SerializerContext {
                     self.checkout_def(DefinitionInterpretation::EmptyableList),
                 ),
                 (false, false) => {
-                    self.checkout_def(DefinitionInterpretation::AllValid);
+                    self.checkout_def(DefinitionInterpretation::AllValidList);
                     (0, 0)
                 }
             };
@@ -530,25 +653,27 @@ impl SerializerContext {
             let def_level = self.checkout_def(DefinitionInterpretation::NullableItem);
             self.do_record_validity(validity, def_level);
         } else {
-            self.checkout_def(DefinitionInterpretation::AllValid);
+            self.checkout_def(DefinitionInterpretation::AllValidItem);
         }
     }
 
     fn build(self) -> SerializedRepDefs {
-        SerializedRepDefs {
-            definition_levels: if self.has_nulls {
-                Some(self.def_levels)
-            } else {
-                None
-            },
-            repetition_levels: if self.current_rep > 1 {
-                Some(self.rep_levels)
-            } else {
-                None
-            },
-            special_records: self.specials,
-            def_meaning: self.def_meaning,
-        }
+        let definition_levels = if self.has_nulls {
+            Some(self.def_levels)
+        } else {
+            None
+        };
+        let repetition_levels = if self.current_rep > 1 {
+            Some(self.rep_levels)
+        } else {
+            None
+        };
+        SerializedRepDefs::new(
+            repetition_levels,
+            definition_levels,
+            self.specials,
+            self.def_meaning,
+        )
     }
 }
 
@@ -901,7 +1026,7 @@ impl RepDefBuilder {
                     .unwrap()
                     .repdefs
                     .iter()
-                    .map(|_| DefinitionInterpretation::AllValid)
+                    .map(|_| DefinitionInterpretation::AllValidItem)
                     .collect::<Vec<_>>(),
             );
         }
@@ -931,7 +1056,7 @@ impl RepDefBuilder {
                 }
             }
         }
-        context.build()
+        dbg!(context.build()).collapse_specials()
     }
 }
 
@@ -968,7 +1093,7 @@ impl RepDefUnraveler {
         levels_to_rep.push(0);
         for meaning in def_meaning.as_ref() {
             match meaning {
-                DefinitionInterpretation::AllValid => {
+                DefinitionInterpretation::AllValidItem | DefinitionInterpretation::AllValidList => {
                     // There is no corresponding level, so nothing to put in levels_to_rep
                 }
                 DefinitionInterpretation::NullableItem => {
@@ -1002,7 +1127,7 @@ impl RepDefUnraveler {
     }
 
     pub fn is_all_valid(&self) -> bool {
-        self.def_meaning[self.current_layer] == DefinitionInterpretation::AllValid
+        self.def_meaning[self.current_layer].is_all_valid()
     }
 
     /// If the current level is a repetition layer then this returns the number of lists
@@ -1048,7 +1173,7 @@ impl RepDefUnraveler {
                 self.current_def_cmp += 2;
                 (valid_level + 1, valid_level + 2)
             }
-            DefinitionInterpretation::AllValid => (0, 0),
+            DefinitionInterpretation::AllValidList => (0, 0),
             _ => unreachable!(),
         };
         let max_level = null_level.max(empty_level);
@@ -1060,6 +1185,7 @@ impl RepDefUnraveler {
         };
         self.current_rep_cmp += 1;
         if let Some(def_levels) = &mut self.def_levels {
+            println!("Has def: {:?}", def_levels);
             let validity = validity.unwrap();
             assert!(rep_levels.len() == def_levels.len());
             // This is a strange access pattern.  We are iterating over the rep/def levels and
@@ -1113,6 +1239,7 @@ impl RepDefUnraveler {
             def_levels.truncate(write_idx);
             Ok(())
         } else {
+            println!("No def");
             // SAFETY: See above loop
             let mut read_idx = 0;
             let mut write_idx = 0;
@@ -1139,13 +1266,17 @@ impl RepDefUnraveler {
     }
 
     pub fn skip_validity(&mut self) {
-        debug_assert!(self.def_meaning[self.current_layer] == DefinitionInterpretation::AllValid);
+        debug_assert!(
+            self.def_meaning[self.current_layer] == DefinitionInterpretation::AllValidItem
+        );
         self.current_layer += 1;
     }
 
     /// Unravels a layer of validity from the definition levels
     pub fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) {
-        debug_assert!(self.def_meaning[self.current_layer] != DefinitionInterpretation::AllValid);
+        debug_assert!(
+            self.def_meaning[self.current_layer] != DefinitionInterpretation::AllValidItem
+        );
         self.current_layer += 1;
 
         let def_levels = &self.def_levels.as_ref().unwrap();
@@ -1200,10 +1331,13 @@ impl CompositeRepDefUnraveler {
     ) -> Result<(OffsetBuffer<T>, Option<NullBuffer>)> {
         let mut is_all_valid = true;
         let mut max_num_lists = 0;
+        println!("Unravelers={:?}", self.unravelers);
         for unraveler in self.unravelers.iter() {
             is_all_valid &= unraveler.is_all_valid();
             max_num_lists += unraveler.max_lists();
         }
+
+        println!("is_all_valid={}", is_all_valid);
 
         let mut validity = if is_all_valid {
             None
@@ -1334,17 +1468,32 @@ fn get_mask(width: u16) -> u16 {
 /// need two bytes.  In the worst case we need 4 bytes though this suggests hundreds of
 /// levels of nesting which seems unlikely to encounter in practice.
 #[derive(Debug)]
-pub enum ControlWordIterator {
-    Binary8(BinaryControlWordIterator<Zip<std::vec::IntoIter<u16>, std::vec::IntoIter<u16>>, u8>),
-    Binary16(BinaryControlWordIterator<Zip<std::vec::IntoIter<u16>, std::vec::IntoIter<u16>>, u16>),
-    Binary32(BinaryControlWordIterator<Zip<std::vec::IntoIter<u16>, std::vec::IntoIter<u16>>, u32>),
-    Unary8(UnaryControlWordIterator<std::vec::IntoIter<u16>, u8>),
-    Unary16(UnaryControlWordIterator<std::vec::IntoIter<u16>, u16>),
-    Unary32(UnaryControlWordIterator<std::vec::IntoIter<u16>, u32>),
+pub enum ControlWordIterator<'a> {
+    Binary8(
+        BinaryControlWordIterator<
+            Zip<Copied<std::slice::Iter<'a, u16>>, Copied<std::slice::Iter<'a, u16>>>,
+            u8,
+        >,
+    ),
+    Binary16(
+        BinaryControlWordIterator<
+            Zip<Copied<std::slice::Iter<'a, u16>>, Copied<std::slice::Iter<'a, u16>>>,
+            u16,
+        >,
+    ),
+    Binary32(
+        BinaryControlWordIterator<
+            Zip<Copied<std::slice::Iter<'a, u16>>, Copied<std::slice::Iter<'a, u16>>>,
+            u32,
+        >,
+    ),
+    Unary8(UnaryControlWordIterator<Copied<std::slice::Iter<'a, u16>>, u8>),
+    Unary16(UnaryControlWordIterator<Copied<std::slice::Iter<'a, u16>>, u16>),
+    Unary32(UnaryControlWordIterator<Copied<std::slice::Iter<'a, u16>>, u32>),
     Nilary(NilaryControlWordIterator),
 }
 
-impl ControlWordIterator {
+impl<'a> ControlWordIterator<'a> {
     /// Appends the next control word to the buffer
     pub fn append_next(&mut self, buf: &mut Vec<u8>) {
         match self {
@@ -1401,12 +1550,12 @@ impl ControlWordIterator {
 /// Builds a [`ControlWordIterator`] from repetition and definition levels
 /// by first calculating the width needed and then creating the iterator
 /// with the appropriate width
-pub fn build_control_word_iterator(
-    rep: Option<Vec<u16>>,
+pub fn build_control_word_iterator<'a>(
+    rep: Option<&'a [u16]>,
     max_rep: u16,
-    def: Option<Vec<u16>>,
+    def: Option<&'a [u16]>,
     max_def: u16,
-) -> ControlWordIterator {
+) -> ControlWordIterator<'a> {
     let rep_width = if max_rep == 0 {
         0
     } else {
@@ -1422,7 +1571,7 @@ pub fn build_control_word_iterator(
     let total_width = rep_width + def_width;
     match (rep, def) {
         (Some(rep), Some(def)) => {
-            let iter = rep.into_iter().zip(def);
+            let iter = rep.iter().copied().zip(def.iter().copied());
             let def_width = def_width as usize;
             if total_width <= 8 {
                 ControlWordIterator::Binary8(BinaryControlWordIterator {
@@ -1457,7 +1606,7 @@ pub fn build_control_word_iterator(
             }
         }
         (Some(lev), None) => {
-            let iter = lev.into_iter();
+            let iter = lev.iter().copied();
             if total_width <= 8 {
                 ControlWordIterator::Unary8(UnaryControlWordIterator {
                     repdef: iter,
@@ -1485,7 +1634,7 @@ pub fn build_control_word_iterator(
             }
         }
         (None, Some(lev)) => {
-            let iter = lev.into_iter();
+            let iter = lev.iter().copied();
             if total_width <= 8 {
                 ControlWordIterator::Unary8(UnaryControlWordIterator {
                     repdef: iter,
@@ -1671,7 +1820,6 @@ mod tests {
 
     use crate::repdef::{
         CompositeRepDefUnraveler, DefinitionInterpretation, RepDefUnraveler, SerializedRepDefs,
-        SpecialRecord,
     };
 
     use super::RepDefBuilder;
@@ -1705,23 +1853,16 @@ mod tests {
         ]));
 
         let repdefs = RepDefBuilder::serialize(vec![builder]);
-        let rep = repdefs.repetition_levels.as_ref().unwrap();
-        let def = repdefs.definition_levels.as_ref().unwrap();
-
-        assert_eq!(vec![0, 0, 0, 1, 1, 1, 0, 0, 1], *def);
-        assert_eq!(vec![2, 1, 0, 2, 0, 1, 0, 0, 0], *rep);
-
-        let collapsed = repdefs.collapse_specials();
-        let rep = collapsed.repetition_levels.unwrap();
-        let def = collapsed.definition_levels.unwrap();
+        let rep = repdefs.repetition_levels.unwrap();
+        let def = repdefs.definition_levels.unwrap();
 
         assert_eq!(vec![0, 0, 0, 3, 1, 1, 2, 1, 0, 0, 1], *def);
         assert_eq!(vec![2, 1, 0, 2, 2, 0, 1, 1, 0, 0, 0], *rep);
 
         let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
-            Some(rep),
-            Some(def),
-            collapsed.def_meaning.into(),
+            Some(rep.as_ref().to_vec()),
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
         )]);
 
         // Note: validity doesn't exactly round-trip because repdef normalizes some of the
@@ -1743,35 +1884,15 @@ mod tests {
     #[test]
     fn test_repdef_simple_null_empty_list() {
         let check = |repdefs: SerializedRepDefs, last_def: DefinitionInterpretation| {
-            let rep = repdefs.repetition_levels.as_ref().unwrap();
-            let def = repdefs.definition_levels.as_ref().unwrap();
+            let rep = repdefs.repetition_levels.unwrap();
+            let def = repdefs.definition_levels.unwrap();
 
-            assert_eq!(vec![1, 0, 1, 0, 0], *rep);
-            assert_eq!(vec![0, 0, 0, 1, 0], *def);
-            assert_eq!(
-                vec![SpecialRecord {
-                    def_level: 2,
-                    rep_level: 1,
-                    pos: 2
-                }],
-                repdefs.special_records
-            );
+            assert_eq!([1, 0, 1, 1, 0, 0], *rep);
+            assert_eq!([0, 0, 2, 0, 1, 0], *def);
+            assert!(repdefs.special_records.is_empty());
             assert_eq!(
                 vec![DefinitionInterpretation::NullableItem, last_def,],
                 repdefs.def_meaning
-            );
-
-            let collapsed = repdefs.collapse_specials();
-
-            let rep = collapsed.repetition_levels.unwrap();
-            let def = collapsed.definition_levels.unwrap();
-
-            assert_eq!(vec![1, 0, 1, 1, 0, 0], rep);
-            assert_eq!(vec![0, 0, 2, 0, 1, 0], def);
-            assert!(collapsed.special_records.is_empty());
-            assert_eq!(
-                vec![DefinitionInterpretation::NullableItem, last_def,],
-                collapsed.def_meaning
             );
         };
 
@@ -1814,26 +1935,11 @@ mod tests {
 
         let repdefs = RepDefBuilder::serialize(vec![builder]);
 
-        let rep = repdefs.repetition_levels.as_ref().unwrap();
-        assert_eq!(vec![2, 1, 2], *rep);
-        assert!(repdefs.definition_levels.is_none());
+        let rep = repdefs.repetition_levels.unwrap();
+        let def = repdefs.definition_levels.unwrap();
 
-        assert_eq!(
-            vec![
-                DefinitionInterpretation::AllValid,
-                DefinitionInterpretation::NullableAndEmptyableList,
-                DefinitionInterpretation::NullableAndEmptyableList,
-            ],
-            repdefs.def_meaning
-        );
-
-        let collapsed = repdefs.collapse_specials();
-
-        let rep = collapsed.repetition_levels.unwrap();
-        let def = collapsed.definition_levels.unwrap();
-
-        assert_eq!(vec![2, 1, 1, 1, 2, 2, 2, 1], rep);
-        assert_eq!(vec![0, 1, 0, 1, 3, 4, 2, 0], def);
+        assert_eq!([2, 1, 1, 1, 2, 2, 2, 1], *rep);
+        assert_eq!([0, 1, 0, 1, 3, 4, 2, 0], *def);
     }
 
     #[test]
@@ -1847,10 +1953,10 @@ mod tests {
         let rep = repdefs.repetition_levels.unwrap();
         assert!(repdefs.definition_levels.is_none());
 
-        assert_eq!(vec![2, 1, 0, 2, 0, 2, 0, 1, 0], rep);
+        assert_eq!([2, 1, 0, 2, 0, 2, 0, 1, 0], *rep);
 
         let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
-            Some(rep),
+            Some(rep.as_ref().to_vec()),
             None,
             repdefs.def_meaning.into(),
         )]);
@@ -1875,11 +1981,11 @@ mod tests {
         assert!(repdefs.repetition_levels.is_none());
         let def = repdefs.definition_levels.unwrap();
 
-        assert_eq!(vec![2, 2, 0, 0, 1], def);
+        assert_eq!([2, 2, 0, 0, 1], *def);
 
         let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
             None,
-            Some(def),
+            Some(def.as_ref().to_vec()),
             repdefs.def_meaning.into(),
         )]);
 
@@ -1911,27 +2017,20 @@ mod tests {
         builder2.add_validity_bitmap(validity(&[false, false, false, true, true, false]));
 
         let repdefs = RepDefBuilder::serialize(vec![builder1, builder2]);
-        let rep = repdefs.repetition_levels.as_ref().unwrap();
-        let def = repdefs.definition_levels.as_ref().unwrap();
 
-        assert_eq!(vec![2, 1, 0, 2, 0, 1, 0, 0, 0], *rep);
-        assert_eq!(vec![0, 0, 0, 1, 1, 1, 0, 0, 1], *def);
+        let rep = repdefs.repetition_levels.unwrap();
+        let def = repdefs.definition_levels.unwrap();
 
-        let collapsed = repdefs.collapse_specials();
-
-        let rep = collapsed.repetition_levels.unwrap();
-        let def = collapsed.definition_levels.unwrap();
-
-        assert_eq!(vec![2, 1, 0, 2, 2, 0, 1, 1, 0, 0, 0], rep);
-        assert_eq!(vec![0, 0, 0, 3, 1, 1, 2, 1, 0, 0, 1], def);
+        assert_eq!([2, 1, 0, 2, 2, 0, 1, 1, 0, 0, 0], *rep);
+        assert_eq!([0, 0, 0, 3, 1, 1, 2, 1, 0, 0, 1], *def);
     }
 
     #[test]
     fn test_control_words() {
         // Convert to control words, verify expected, convert back, verify same as original
         fn check(
-            rep: Vec<u16>,
-            def: Vec<u16>,
+            rep: &[u16],
+            def: &[u16],
             expected_values: Vec<u8>,
             expected_bytes_per_word: usize,
             expected_bits_rep: u8,
@@ -1941,16 +2040,8 @@ mod tests {
             let max_rep = rep.iter().max().copied().unwrap_or(0);
             let max_def = def.iter().max().copied().unwrap_or(0);
 
-            let in_rep = if rep.is_empty() {
-                None
-            } else {
-                Some(rep.clone())
-            };
-            let in_def = if def.is_empty() {
-                None
-            } else {
-                Some(def.clone())
-            };
+            let in_rep = if rep.is_empty() { None } else { Some(rep) };
+            let in_def = if def.is_empty() { None } else { Some(def) };
 
             let mut iter = super::build_control_word_iterator(in_rep, max_rep, in_def, max_def);
             assert_eq!(iter.bytes_per_word(), expected_bytes_per_word);
@@ -1975,13 +2066,13 @@ mod tests {
                 }
             }
 
-            assert_eq!(rep, rep_out);
-            assert_eq!(def, def_out);
+            assert_eq!(rep.as_ref(), rep_out.as_slice());
+            assert_eq!(def.as_ref(), def_out.as_slice());
         }
 
         // Each will need 4 bits and so we should get 1-byte control words
-        let rep = vec![0_u16, 7, 3, 2, 9, 8, 12, 5];
-        let def = vec![5_u16, 3, 1, 2, 12, 15, 0, 2];
+        let rep = &[0_u16, 7, 3, 2, 9, 8, 12, 5];
+        let def = &[5_u16, 3, 1, 2, 12, 15, 0, 2];
         let expected = vec![
             0b00000101, // 0, 5
             0b01110011, // 7, 3
@@ -1995,8 +2086,8 @@ mod tests {
         check(rep, def, expected, 1, 4, 4);
 
         // Now we need 5 bits for def so we get 2-byte control words
-        let rep = vec![0_u16, 7, 3, 2, 9, 8, 12, 5];
-        let def = vec![5_u16, 3, 1, 2, 12, 22, 0, 2];
+        let rep = &[0_u16, 7, 3, 2, 9, 8, 12, 5];
+        let def = &[5_u16, 3, 1, 2, 12, 22, 0, 2];
         let expected = vec![
             0b00000101, 0b00000000, // 0, 5
             0b11100011, 0b00000000, // 7, 3
@@ -2010,7 +2101,7 @@ mod tests {
         check(rep, def, expected, 2, 4, 5);
 
         // Just rep, 4 bits so 1 byte each
-        let levels = vec![0_u16, 7, 3, 2, 9, 8, 12, 5];
+        let levels = &[0_u16, 7, 3, 2, 9, 8, 12, 5];
         let expected = vec![
             0b00000000, // 0
             0b00000111, // 7
@@ -2021,12 +2112,12 @@ mod tests {
             0b00001100, // 12
             0b00000101, // 5
         ];
-        check(levels.clone(), Vec::default(), expected.clone(), 1, 4, 0);
+        check(levels, &[], expected.clone(), 1, 4, 0);
 
         // Just def
-        check(Vec::default(), levels, expected, 1, 0, 4);
+        check(&[], levels, expected, 1, 0, 4);
 
         // No rep, no def, no bytes
-        check(Vec::default(), Vec::default(), Vec::default(), 0, 0, 0);
+        check(&[], &[], Vec::default(), 0, 0, 0);
     }
 }
