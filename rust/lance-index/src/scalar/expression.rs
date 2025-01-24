@@ -18,7 +18,7 @@ use lance_core::{utils::mask::RowIdMask, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use tracing::instrument;
 
-use super::{AnyQuery, LabelListQuery, SargableQuery, ScalarIndex};
+use super::{AnyQuery, LabelListQuery, SargableQuery, ScalarIndex, TextQuery};
 
 /// An indexed expression consists of a scalar index query with a post-scan filter
 ///
@@ -211,6 +211,155 @@ impl ScalarQueryParser for LabelListQueryParser {
         } else {
             None
         }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TextQueryParser {}
+
+impl ScalarQueryParser for TextQueryParser {
+    fn visit_between(
+        &self,
+        _column: &str,
+        _low: ScalarValue,
+        _high: ScalarValue,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_in_list(
+        &self,
+        _column: &str,
+        _in_list: Vec<ScalarValue>,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_bool(&self, _column: &str, _value: bool) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_null(&self, _column: &str) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_comparison(
+        &self,
+        _column: &str,
+        _value: ScalarValue,
+        _op: &Operator,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        if args.len() != 2 {
+            return None;
+        }
+        let substring = maybe_scalar(&args[1], data_type)?;
+        if matches!(substring, ScalarValue::Utf8(_)) {
+            if func.name() == "contains" {
+                let query = TextQuery::StringContains(substring);
+                Some(IndexedExpression::index_query(
+                    column.to_string(),
+                    Arc::new(query),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct QueryParserChain {
+    parsers: Vec<Box<dyn ScalarQueryParser>>,
+}
+
+impl QueryParserChain {
+    pub fn new(parsers: Vec<Box<dyn ScalarQueryParser>>) -> Self {
+        Self { parsers }
+    }
+}
+
+impl ScalarQueryParser for QueryParserChain {
+    fn visit_between(
+        &self,
+        column: &str,
+        low: ScalarValue,
+        high: ScalarValue,
+    ) -> Option<IndexedExpression> {
+        for parser in &self.parsers {
+            if let Some(indexed_expr) = parser.visit_between(column, low.clone(), high.clone()) {
+                return Some(indexed_expr);
+            }
+        }
+        None
+    }
+
+    fn visit_in_list(&self, column: &str, in_list: Vec<ScalarValue>) -> Option<IndexedExpression> {
+        for parser in &self.parsers {
+            if let Some(indexed_expr) = parser.visit_in_list(column, in_list.clone()) {
+                return Some(indexed_expr);
+            }
+        }
+        None
+    }
+
+    fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
+        for parser in &self.parsers {
+            if let Some(indexed_expr) = parser.visit_is_bool(column, value) {
+                return Some(indexed_expr);
+            }
+        }
+        None
+    }
+
+    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
+        for parser in &self.parsers {
+            if let Some(indexed_expr) = parser.visit_is_null(column) {
+                return Some(indexed_expr);
+            }
+        }
+        None
+    }
+
+    fn visit_comparison(
+        &self,
+        column: &str,
+        value: ScalarValue,
+        op: &Operator,
+    ) -> Option<IndexedExpression> {
+        for parser in &self.parsers {
+            if let Some(indexed_expr) = parser.visit_comparison(column, value.clone(), op) {
+                return Some(indexed_expr);
+            }
+        }
+        None
+    }
+
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        for parser in &self.parsers {
+            if let Some(indexed_expr) = parser.visit_scalar_function(column, data_type, func, args)
+            {
+                return Some(indexed_expr);
+            }
+        }
+        None
     }
 }
 

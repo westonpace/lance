@@ -18,6 +18,7 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
     IndexInformationProvider, LabelListQueryParser, SargableQueryParser, ScalarQueryParser,
+    TextQueryParser,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndex, ScalarIndexType};
@@ -903,11 +904,13 @@ impl DatasetIndexInternalExt for Dataset {
                     let index_type =
                         detect_scalar_index_type(self, index, &field.name, self.session.as_ref())
                             .await?;
-                    // Inverted index can't be used for filtering
+
                     if matches!(index_type, ScalarIndexType::Inverted) {
-                        continue;
+                        // Inverted indices can satisfy text queries today (maybe sargable queries in the future)
+                        Box::<TextQueryParser>::default() as Box<dyn ScalarQueryParser>
+                    } else {
+                        Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>
                     }
-                    Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>
                 }
                 _ => Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>,
             };

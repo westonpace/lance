@@ -11,6 +11,7 @@ use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_array::{ListArray, RecordBatch};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
+use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_array::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{scalar::ScalarValue, Column};
@@ -236,6 +237,9 @@ impl PartialEq for dyn AnyQuery {
 }
 
 /// A full text search query
+///
+/// Note:  This is for a nearest neighbor search, not a boolean search.
+/// See [TextQuery] for boolean search.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FullTextSearchQuery {
     /// The columns to search,
@@ -395,6 +399,45 @@ impl AnyQuery for SargableQuery {
             }
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone())),
+        }
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
+        }
+    }
+}
+
+/// Queries that can be satisfied by a full text search index
+///
+/// This is a boolean search, not a nearest neighbor search.  See
+/// [FullTextSearchQuery] for nearest neighbor search.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TextQuery {
+    /// Retrieve all row ids where the given substring is contained in the text
+    StringContains(String),
+}
+
+impl AnyQuery for TextQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        format!("{}", self.to_expr(col.to_string()))
+    }
+
+    fn to_expr(&self, col: String) -> Expr {
+        match self {
+            Self::StringContains(substr) => Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(ContainsFunc::new().into()),
+                args: vec![
+                    Expr::Column(Column::new_unqualified(col)),
+                    Expr::Literal(ScalarValue::Utf8(Some(substr.clone()))),
+                ],
+            }),
         }
     }
 
