@@ -252,7 +252,7 @@ use crate::encodings::physical::binary::{
     BinaryBlockDecompressor, BinaryMiniBlockDecompressor, VariableDecoder,
 };
 use crate::encodings::physical::bitpack_fastlanes::BitpackMiniBlockDecompressor;
-use crate::encodings::physical::fsst::FsstMiniBlockDecompressor;
+use crate::encodings::physical::fsst::{FsstMiniBlockDecompressor, FsstPerValueDecompressor};
 use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockDecompressor;
 use crate::encodings::physical::value::{ConstantDecompressor, ValueDecompressor};
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
@@ -551,6 +551,12 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
             &pb::array_encoding::ArrayEncoding::Variable(variable) => {
                 assert!(variable.bits_per_offset < u8::MAX as u32);
                 Ok(Box::new(VariableDecoder::default()))
+            }
+            &pb::array_encoding::ArrayEncoding::Fsst(ref fsst) => {
+                Ok(Box::new(FsstPerValueDecompressor::new(
+                    fsst.symbol_table.clone(),
+                    Box::new(VariableDecoder::default()),
+                )))
             }
             _ => todo!("variable-per-value decompressor for {:?}", description),
         }
