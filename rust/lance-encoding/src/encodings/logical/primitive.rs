@@ -4252,7 +4252,7 @@ impl PrimitiveStructuralEncoder {
                 }
             }
             _ => {
-                unreachable!()
+                unreachable!("dictionary encode called with data block {:?}", data_block)
             }
         }
     }

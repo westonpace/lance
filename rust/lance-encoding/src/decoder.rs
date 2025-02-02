@@ -1622,8 +1622,11 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
                 }
             }
         }
+
+        let loaded_need = self.rows_drained + self.rows_per_batch as u64 - 1;
+
         self.root_decoder
-            .wait(self.rows_scheduled, &self.wait_for_io_runtime)?;
+            .wait(loaded_need, &self.wait_for_io_runtime)?;
         Ok(self.rows_scheduled)
     }
 
@@ -1916,14 +1919,13 @@ pub fn create_decode_iterator(
         ))
     } else {
         let root_decoder = SimpleStructDecoder::new(root_fields, num_rows);
-        let _legacy_iterator = Box::new(BatchDecodeIterator::new(
+        Box::new(BatchDecodeIterator::new(
             messages,
             batch_size,
             num_rows,
             root_decoder,
             arrow_schema,
-        ));
-        todo!("The synchronous path for 2.0 is not quite working yet")
+        ))
     }
 }
 
