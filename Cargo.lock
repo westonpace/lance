@@ -4239,7 +4239,10 @@ version = "0.25.3"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "async-trait",
+ "bytes",
  "datafusion",
+ "futures",
  "jni",
  "lance",
  "lance-core",

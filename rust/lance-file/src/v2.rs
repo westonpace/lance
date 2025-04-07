@@ -6,4 +6,4 @@ pub mod reader;
 pub mod testing;
 pub mod writer;
 
-pub use io::LanceEncodingsIo;
+pub use io::{LanceEncodingsIo, LanceEncodingsIoRef};

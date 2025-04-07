@@ -94,7 +94,7 @@ pub struct FileWriterOptions {
 }
 
 pub struct FileWriter {
-    writer: ObjectWriter,
+    writer: Box<dyn Writer>,
     schema: Option<LanceSchema>,
     column_writers: Vec<Box<dyn FieldEncoder>>,
     column_metadata: Vec<pbfile::ColumnMetadata>,
@@ -134,6 +134,11 @@ impl FileWriter {
     /// The output schema will be set based on the first batch of data to arrive.
     /// If no data arrives and the writer is finished then the write will fail.
     pub fn new_lazy(object_writer: ObjectWriter, options: FileWriterOptions) -> Self {
+        Self::new_custom_io(Box::new(object_writer), options)
+    }
+
+    /// Create a new FileWriter from a custom I/O writer
+    pub fn new_custom_io(writer: Box<dyn Writer>, options: FileWriterOptions) -> Self {
         if let Some(format_version) = options.format_version {
             if format_version > LanceFileVersion::Stable
                 && WARNED_ON_UNSTABLE_API
@@ -149,7 +154,7 @@ impl FileWriter {
             }
         }
         Self {
-            writer: object_writer,
+            writer,
             schema: None,
             column_writers: Vec::new(),
             column_metadata: Vec::new(),
@@ -180,7 +185,7 @@ impl FileWriter {
         Ok(writer.finish().await? as usize)
     }
 
-    async fn do_write_buffer(writer: &mut ObjectWriter, buf: &[u8]) -> Result<()> {
+    async fn do_write_buffer(writer: &mut dyn Writer, buf: &[u8]) -> Result<()> {
         writer.write_all(buf).await?;
         let pad_bytes = pad_bytes::<PAGE_BUFFER_ALIGNMENT>(buf.len());
         writer.write_all(&PAD_BUFFER[..pad_bytes]).await?;
@@ -199,7 +204,7 @@ impl FileWriter {
         for buffer in buffers {
             buffer_offsets.push(self.writer.tell().await? as u64);
             buffer_sizes.push(buffer.len() as u64);
-            Self::do_write_buffer(&mut self.writer, &buffer).await?;
+            Self::do_write_buffer(self.writer.as_mut(), &buffer).await?;
         }
         let encoded_encoding = match encoded_page.description {
             PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
@@ -386,7 +391,7 @@ impl FileWriter {
         let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
         // Next, write external buffers
         for external_buffer in external_buffers.take_buffers() {
-            Self::do_write_buffer(&mut self.writer, &external_buffer).await?;
+            Self::do_write_buffer(self.writer.as_mut(), &external_buffer).await?;
         }
 
         let encoding_tasks = encoding_tasks
@@ -472,7 +477,7 @@ impl FileWriter {
     pub async fn add_global_buffer(&mut self, buffer: Bytes) -> Result<u32> {
         let position = self.writer.tell().await? as u64;
         let len = buffer.len() as u64;
-        Self::do_write_buffer(&mut self.writer, &buffer).await?;
+        Self::do_write_buffer(self.writer.as_mut(), &buffer).await?;
         self.global_buffers.push((position, len));
         Ok(self.global_buffers.len() as u32)
     }
@@ -503,7 +508,7 @@ impl FileWriter {
                 for buffer in column.column_buffers {
                     column_metadata.buffer_offsets.push(buffer_pos);
                     let mut size = 0;
-                    Self::do_write_buffer(&mut self.writer, &buffer).await?;
+                    Self::do_write_buffer(self.writer.as_mut(), &buffer).await?;
                     size += buffer.len() as u64;
                     buffer_pos += size;
                     column_metadata.buffer_sizes.push(size);
@@ -555,7 +560,7 @@ impl FileWriter {
             .map(|writer| writer.flush(&mut external_buffers))
             .collect::<Result<Vec<_>>>()?;
         for external_buffer in external_buffers.take_buffers() {
-            Self::do_write_buffer(&mut self.writer, &external_buffer).await?;
+            Self::do_write_buffer(self.writer.as_mut(), &external_buffer).await?;
         }
         let encoding_tasks = encoding_tasks
             .into_iter()

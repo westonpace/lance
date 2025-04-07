@@ -1,8 +1,15 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    future::Future,
+    io::{Error as IoError, ErrorKind},
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::Poll,
+};
 
 use crate::{
     error::{Error, Result},
     traits::IntoJava,
+    utils::JvmRef,
     RT,
 };
 use arrow::{
@@ -10,18 +17,205 @@ use arrow::{
     ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema},
 };
 use arrow_schema::DataType;
+use async_trait::async_trait;
 use jni::{
-    objects::{JObject, JString},
+    errors::Error as JniError,
+    objects::{GlobalRef, JObject, JString, JValueGen},
     sys::jlong,
-    JNIEnv,
+    JNIEnv, JavaVM,
 };
 use lance::io::ObjectStore;
+use lance::{Error as LanceError, Result as LanceResult};
 use lance_file::{
     v2::writer::{FileWriter, FileWriterOptions},
     version::LanceFileVersion,
 };
+use lance_io::traits::Writer;
+use snafu::location;
+use tokio::{io::AsyncWrite, task::JoinHandle};
 
 pub const NATIVE_WRITER: &str = "nativeFileWriterHandle";
+
+pub struct CallbackWriter {
+    jvm: JvmRef,
+    output_stream: GlobalRef,
+    write_task: Option<JoinHandle<std::result::Result<(), JniError>>>,
+    shutdown: bool,
+}
+
+impl CallbackWriter {
+    pub fn new(env: &mut JNIEnv<'_>, output_stream: JObject) -> Result<Self> {
+        let jvm = JvmRef::new(env.get_java_vm()?.get_java_vm_pointer());
+        let output_stream = env.new_global_ref(output_stream)?;
+        Ok(Self {
+            jvm,
+            output_stream,
+            write_task: None,
+            shutdown: false,
+        })
+    }
+}
+
+impl AsyncWrite for CallbackWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::result::Result<usize, IoError>> {
+        let this = self.get_mut();
+        // A write may already be in progress, if so, block until it completes
+        if let Some(mut write_task) = this.write_task.take() {
+            let write_task_pin = Pin::new(&mut write_task);
+            match write_task_pin.poll(cx) {
+                Poll::Ready(Ok(Ok(_))) => {}
+                Poll::Ready(Ok(Err(e))) => {
+                    return std::task::Poll::Ready(Err(IoError::new(ErrorKind::Other, e)));
+                }
+                Poll::Ready(Err(e)) => {
+                    return std::task::Poll::Ready(Err(IoError::new(ErrorKind::Other, e)));
+                }
+                Poll::Pending => {
+                    this.write_task = Some(write_task);
+                    return std::task::Poll::Pending;
+                }
+            }
+        }
+        if this.shutdown {
+            return Poll::Ready(Err(IoError::new(ErrorKind::Other, "Writer is closed")));
+        }
+        let jvm = this.jvm;
+        let output_stream = this.output_stream.clone();
+        let num_bytes = buf.len();
+        let buf = buf.to_vec();
+        let write_task = tokio::task::spawn_blocking(move || {
+            // Tell rust we are capturing jvm and not jvm.val
+            let _ = &jvm;
+            let jvm = unsafe { JavaVM::from_raw(jvm.val) }?;
+            let mut jvm_env = jvm.attach_current_thread()?;
+            let java_bytes = jvm_env.byte_array_from_slice(&buf)?;
+            jvm_env.call_method(
+                output_stream.as_obj(),
+                "write",
+                "([B)V",
+                &[JValueGen::from(&java_bytes)],
+            )?;
+            Ok(())
+        });
+        this.write_task = Some(write_task);
+        Poll::Ready(Ok(num_bytes))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        let this = self.get_mut();
+        if let Some(mut write_task) = this.write_task.take() {
+            let write_task_pin = Pin::new(&mut write_task);
+            match write_task_pin.poll(cx) {
+                Poll::Ready(Ok(Ok(_))) => {}
+                Poll::Ready(Ok(Err(e))) => {
+                    return std::task::Poll::Ready(Err(IoError::new(ErrorKind::Other, e)));
+                }
+                Poll::Ready(Err(e)) => {
+                    return std::task::Poll::Ready(Err(IoError::new(ErrorKind::Other, e)));
+                }
+                Poll::Pending => {
+                    this.write_task = Some(write_task);
+                    return std::task::Poll::Pending;
+                }
+            }
+        }
+        if this.shutdown {
+            return Poll::Ready(Err(IoError::new(ErrorKind::Other, "Writer is closed")));
+        }
+        let jvm = this.jvm;
+        let output_stream = this.output_stream.clone();
+        let write_task = tokio::task::spawn_blocking(move || {
+            let _ = &jvm;
+            let jvm = unsafe { JavaVM::from_raw(jvm.val) }?;
+            let mut jvm_env = jvm.attach_current_thread()?;
+            jvm_env.call_method(output_stream.as_obj(), "flush", "()V", &[])?;
+            Ok(())
+        });
+        this.write_task = Some(write_task);
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        let this = self.get_mut();
+        if let Some(mut write_task) = this.write_task.take() {
+            let write_task_pin = Pin::new(&mut write_task);
+            match write_task_pin.poll(cx) {
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => {
+                    return std::task::Poll::Ready(Err(IoError::new(ErrorKind::Other, e)));
+                }
+                Poll::Pending => {
+                    this.write_task = Some(write_task);
+                    return std::task::Poll::Pending;
+                }
+            }
+        }
+        if this.shutdown {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        this.shutdown = true;
+        let jvm = this.jvm;
+        let output_stream = this.output_stream.clone();
+        let mut write_task = tokio::task::spawn_blocking(move || {
+            let _ = &jvm;
+            let jvm = unsafe { JavaVM::from_raw(jvm.val) }?;
+            let mut jvm_env = jvm.attach_current_thread()?;
+            jvm_env.call_method(output_stream.as_obj(), "close", "()V", &[])?;
+            Ok(())
+        });
+        let tmp_write_task = Pin::new(&mut write_task);
+        match tmp_write_task.poll(cx) {
+            Poll::Ready(Ok(_)) => {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Err(e)) => {
+                return std::task::Poll::Ready(Err(IoError::new(ErrorKind::Other, e)));
+            }
+            Poll::Pending => {
+                this.write_task = Some(write_task);
+                return std::task::Poll::Pending;
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Writer for CallbackWriter {
+    async fn tell(&mut self) -> LanceResult<usize> {
+        if let Some(write_task) = self.write_task.take() {
+            write_task.await?.map_err(|e| LanceError::Wrapped {
+                error: Box::new(e),
+                location: location!(),
+            })?;
+        }
+        let jvm = self.jvm;
+        let output_stream = self.output_stream.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = &jvm;
+            let jvm = unsafe { JavaVM::from_raw(jvm.val) }
+                .map_err(|e| IoError::new(ErrorKind::Other, e))?;
+            let mut jvm_env = jvm
+                .attach_current_thread()
+                .map_err(|e| IoError::new(ErrorKind::Other, e))?;
+            let res = jvm_env
+                .call_method(output_stream.as_obj(), "tell", "()J", &[])
+                .map_err(|e| IoError::new(ErrorKind::Other, e))?;
+            Ok(res.j().map_err(|e| IoError::new(ErrorKind::Other, e))? as usize)
+        })
+        .await
+        .unwrap()
+    }
+}
 
 #[derive(Clone)]
 pub struct BlockingFileWriter {
@@ -75,6 +269,35 @@ fn inner_open<'local>(env: &mut JNIEnv<'local>, file_uri: JString) -> Result<JOb
 
         Result::Ok(FileWriter::new_lazy(
             obj_writer,
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            },
+        ))
+    })?;
+
+    let writer = BlockingFileWriter::create(writer);
+
+    writer.into_java(env)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_file_LanceFileWriter_openNativeWithJavaIo<'local>(
+    mut env: JNIEnv<'local>,
+    _writer_class: JObject,
+    output_stream: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_open_with_java_io(&mut env, output_stream))
+}
+
+fn inner_open_with_java_io<'local>(
+    env: &mut JNIEnv<'local>,
+    output_stream: JObject,
+) -> Result<JObject<'local>> {
+    let callback_writer = Box::new(CallbackWriter::new(env, output_stream)?);
+    let writer = RT.block_on(async move {
+        Result::Ok(FileWriter::new_custom_io(
+            callback_writer,
             FileWriterOptions {
                 format_version: Some(LanceFileVersion::V2_1),
                 ..Default::default()

@@ -37,6 +37,9 @@ public class LanceFileReader implements AutoCloseable {
 
   private static native LanceFileReader openNative(String fileUri) throws IOException;
 
+  private static native LanceFileReader openNativeWithJavaIo(LanceInput inputStream, String path)
+      throws IOException;
+
   private native void closeNative(long nativeLanceFileReaderHandle) throws IOException;
 
   private native long numRowsNative() throws IOException;
@@ -56,6 +59,14 @@ public class LanceFileReader implements AutoCloseable {
    */
   public static LanceFileReader open(String path, BufferAllocator allocator) throws IOException {
     LanceFileReader reader = openNative(path);
+    reader.allocator = allocator;
+    reader.schema = reader.load_schema();
+    return reader;
+  }
+
+  public static LanceFileReader openWithJavaIo(
+      LanceInput inputStream, String path, BufferAllocator allocator) throws IOException {
+    LanceFileReader reader = openNativeWithJavaIo(inputStream, path);
     reader.allocator = allocator;
     reader.schema = reader.load_schema();
     return reader;

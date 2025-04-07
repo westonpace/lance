@@ -15,6 +15,8 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.file.LanceFileReader;
 import com.lancedb.lance.file.LanceFileWriter;
+import com.lancedb.lance.file.LanceInput;
+import com.lancedb.lance.file.LanceOutput;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -29,7 +31,10 @@ import org.apache.arrow.vector.util.Text;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.nio.file.Path;
 import java.util.Arrays;
 
@@ -39,6 +44,71 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 public class FileReaderWriterTest {
+
+  private static class LanceOutputStream extends LanceOutput {
+
+    private final OutputStream outputStream;
+    private long position;
+
+    public LanceOutputStream(OutputStream outputStream) {
+      this.outputStream = outputStream;
+      this.position = 0;
+    }
+
+    @Override
+    public long tell() throws IOException {
+      return position;
+    }
+
+    @Override
+    public void write(int b) throws IOException {
+      outputStream.write(b);
+      position++;
+    }
+
+    @Override
+    public void write(byte[] b) throws IOException {
+      outputStream.write(b, 0, b.length);
+      position += b.length;
+    }
+
+    @Override
+    public void write(byte[] b, int off, int len) throws IOException {
+      outputStream.write(b, off, len);
+      position += len;
+    }
+
+    @Override
+    public void flush() throws IOException {
+      outputStream.flush();
+    }
+
+    @Override
+    public void close() throws IOException {
+      outputStream.close();
+    }
+  }
+
+  private static class SeekableInputStream implements LanceInput {
+    private final RandomAccessFile inputFile;
+
+    public SeekableInputStream(RandomAccessFile inputFile) {
+      this.inputFile = inputFile;
+    }
+
+    @Override
+    public long fileSize() throws IOException {
+      return inputFile.length();
+    }
+
+    @Override
+    public byte[] readAt(long offset, long length) throws IOException {
+      inputFile.seek(offset);
+      byte[] buffer = new byte[(int) length];
+      inputFile.read(buffer);
+      return buffer;
+    }
+  }
 
   @TempDir private static Path tempDir;
 
@@ -127,6 +197,27 @@ public class FileReaderWriterTest {
   void testBasicWrite() throws Exception {
     String filePath = tempDir.resolve("basic_write.lance").toString();
     createSimpleFile(filePath);
+  }
+
+  @Test
+  void testBasicWithJavaIo() throws Exception {
+    String filePath = tempDir.resolve("basic_write_with_java_output_stream.lance").toString();
+    try (OutputStream outputStream = new FileOutputStream(filePath);
+        BufferAllocator allocator = new RootAllocator()) {
+      try (LanceFileWriter writer =
+          LanceFileWriter.openWithJavaIo(new LanceOutputStream(outputStream), allocator, null)) {
+        try (VectorSchemaRoot batch = createBatch(allocator)) {
+          writer.write(batch);
+        }
+      }
+    }
+    try (BufferAllocator allocator = new RootAllocator();
+        RandomAccessFile inputFile = new RandomAccessFile(filePath, "r");
+        LanceFileReader reader =
+            LanceFileReader.openWithJavaIo(
+                new SeekableInputStream(inputFile), filePath, allocator)) {
+      assertEquals(100, reader.numRows());
+    }
   }
 
   @Test

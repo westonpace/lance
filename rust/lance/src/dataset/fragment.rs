@@ -29,7 +29,7 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
-use lance_file::v2::LanceEncodingsIo;
+use lance_file::v2::{LanceEncodingsIo, LanceEncodingsIoRef};
 use lance_file::version::LanceFileVersion;
 use lance_file::{determine_file_version, v2};
 use lance_io::object_store::ObjectStore;
@@ -887,18 +887,15 @@ impl FileFragment {
                 .await?;
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let path = file_scheduler.reader().path().clone();
-            let reader = Arc::new(
-                v2::reader::FileReader::try_open_with_file_metadata(
-                    Arc::new(LanceEncodingsIo(file_scheduler.clone())),
-                    path,
-                    None,
-                    Arc::<DecoderPlugins>::default(),
-                    file_metadata,
-                    &self.dataset.session.file_metadata_cache,
-                    FileReaderOptions::default(),
-                )
-                .await?,
-            );
+            let reader = Arc::new(v2::reader::FileReader::try_open_with_file_metadata(
+                Arc::new(LanceEncodingsIo(file_scheduler.clone())),
+                path,
+                None,
+                Arc::<DecoderPlugins>::default(),
+                file_metadata,
+                &self.dataset.session.file_metadata_cache,
+                FileReaderOptions::default(),
+            )?);
             let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
                 data_file
                     .fields
@@ -1324,7 +1321,8 @@ impl FileFragment {
         let file_metadata = cache
             .get_or_insert(path, |_path| async {
                 let file_metadata: CachedFileMetadata =
-                    v2::reader::FileReader::read_all_metadata(file_scheduler).await?;
+                    v2::reader::FileReader::read_all_metadata(&LanceEncodingsIoRef(file_scheduler))
+                        .await?;
                 Ok(file_metadata)
             })
             .await?;

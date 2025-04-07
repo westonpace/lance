@@ -1,28 +1,133 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::{
     error::{Error, Result},
     traits::IntoJava,
+    utils::JvmRef,
     RT,
 };
 use arrow::{array::RecordBatchReader, ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::{future::BoxFuture, FutureExt};
 use jni::{
-    objects::{JObject, JString},
+    errors::Error as JniError,
+    objects::{GlobalRef, JByteArray, JObject, JString, JValue},
     sys::{jint, jlong},
-    JNIEnv,
+    JNIEnv, JavaVM,
 };
 use lance::io::ObjectStore;
 use lance_core::cache::FileMetadataCache;
-use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2::reader::{FileReader, FileReaderOptions};
+use lance_encoding::{
+    decoder::{DecoderPlugins, FilterExpression},
+    EncodingsIo,
+};
+use lance_file::v2::reader::{FileReader, FileReaderBuilder, FileReaderIo, FileReaderOptions};
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
     ReadBatchParams,
 };
 use object_store::path::Path;
+use snafu::location;
 
 pub const NATIVE_READER: &str = "nativeFileReaderHandle";
+
+pub struct CallbackReader {
+    jvm: Arc<Mutex<JvmRef>>,
+    input_stream: GlobalRef,
+    shutdown: bool,
+}
+
+impl std::fmt::Debug for CallbackReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CallbackReader(shutdown={})", self.shutdown)
+    }
+}
+
+impl CallbackReader {
+    pub fn new(env: &mut JNIEnv<'_>, input_stream: JObject) -> Result<Self> {
+        let jvm = JvmRef::new(env.get_java_vm()?.get_java_vm_pointer());
+        let input_stream = env.new_global_ref(input_stream)?;
+        Ok(Self {
+            jvm: Arc::new(Mutex::new(jvm)),
+            input_stream,
+            shutdown: false,
+        })
+    }
+}
+
+impl EncodingsIo for CallbackReader {
+    fn submit_request(
+        &self,
+        ranges: Vec<std::ops::Range<u64>>,
+        _priority: u64,
+    ) -> BoxFuture<'static, lance::Result<Vec<Bytes>>> {
+        let jvm = self.jvm.clone();
+        let input_stream = self.input_stream.clone();
+        async move {
+            let byte_buffers = tokio::task::spawn_blocking(move || {
+                let jvm = {
+                    let jvm_ptr = jvm.lock().unwrap();
+                    unsafe { JavaVM::from_raw(jvm_ptr.val) }
+                }?;
+
+                let mut jvm_env = jvm.attach_current_thread()?;
+
+                let mut byte_buffers = Vec::with_capacity(ranges.len());
+                for range in ranges {
+                    let res = jvm_env.call_method(
+                        input_stream.as_obj(),
+                        "readAt",
+                        "(JJ)[B",
+                        &[
+                            JValue::Long(range.start as i64),
+                            JValue::Long((range.end - range.start) as i64),
+                        ],
+                    )?;
+                    let res_arr: JByteArray<'_> = res.l()?.into();
+                    let res_bytes = jvm_env.convert_byte_array(&res_arr)?;
+                    byte_buffers.push(Bytes::from(res_bytes));
+                }
+                std::result::Result::<_, JniError>::Ok(byte_buffers)
+            })
+            .await
+            .unwrap();
+            Ok(byte_buffers.map_err(|e| {
+                lance::Error::io(format!("Error reading bytes: {}", e), location!())
+            })?)
+        }
+        .boxed()
+    }
+}
+
+#[async_trait]
+impl FileReaderIo for CallbackReader {
+    async fn file_size(&self) -> std::result::Result<u64, lance::Error> {
+        let jvm = self.jvm.clone();
+        let input_stream = self.input_stream.clone();
+        let file_size = tokio::task::spawn_blocking(move || {
+            let jvm = {
+                let jvm_ptr = jvm.lock().unwrap();
+                unsafe { JavaVM::from_raw(jvm_ptr.val) }
+            }?;
+
+            let mut jvm_env = jvm.attach_current_thread()?;
+            let res = jvm_env.call_method(input_stream.as_obj(), "fileSize", "()J", &[])?;
+            let file_size: jlong = res.j()?;
+            std::result::Result::<_, JniError>::Ok(file_size as u64)
+        })
+        .await
+        .unwrap();
+        Ok(file_size.map_err(|e| {
+            lance::Error::io(format!("Error getting file size: {}", e), location!())
+        })?)
+    }
+
+    fn metadata_read_size(&self) -> u64 {
+        4096
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct BlockingFileReader {
@@ -102,6 +207,40 @@ fn inner_open<'local>(env: &mut JNIEnv<'local>, file_uri: JString) -> Result<JOb
             FileReaderOptions::default(),
         )
         .await
+    })?;
+
+    let reader = BlockingFileReader::create(Arc::new(reader));
+
+    reader.into_java(env)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_file_LanceFileReader_openNativeWithJavaIo<'local>(
+    mut env: JNIEnv<'local>,
+    _reader_class: JObject,
+    input_stream: JObject,
+    path_str_obj: JString,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_open_java_io(&mut env, input_stream, path_str_obj)
+    )
+}
+
+fn inner_open_java_io<'local>(
+    env: &mut JNIEnv<'local>,
+    input_stream: JObject,
+    path_str_obj: JString,
+) -> Result<JObject<'local>> {
+    let path_str: String = env.get_string(&path_str_obj)?.into();
+    let path = Path::parse(&path_str)
+        .map_err(|e| Error::input_error(format!("Invalid path string: {}", e)))?;
+    let callback_reader = Arc::new(CallbackReader::new(env, input_stream)?);
+
+    let reader = RT.block_on(async move {
+        FileReaderBuilder::new_custom(callback_reader, path)
+            .build()
+            .await
     })?;
 
     let reader = BlockingFileReader::create(Arc::new(reader));

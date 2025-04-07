@@ -11,6 +11,7 @@ use std::{
 
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
+use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use deepsize::{Context, DeepSizeOf};
@@ -292,6 +293,24 @@ impl ReaderProjection {
     }
 }
 
+/// Extends the [`EncodingsIo`] trait with methods for getting the file size
+/// and block size.
+#[async_trait]
+pub trait FileReaderIo: EncodingsIo {
+    /// Get the total size (in bytes) of the file.
+    ///
+    /// When reading metadata we read from the end of the file and the file size
+    /// must be known to perform the read.
+    async fn file_size(&self) -> Result<u64>;
+
+    /// A guess at the size of the metadata section of the file.
+    ///
+    /// If this is too small we will need two IOPS to read the metadata.  If this
+    /// is too large we will waste time reading more footer than needed.  This is
+    /// generally set to the minimum size of an I/O request for the file system.
+    fn metadata_read_size(&self) -> u64;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FileReaderOptions {
     validate_on_decode: bool,
@@ -380,14 +399,14 @@ impl FileReader {
             .await
     }
 
-    async fn read_tail(scheduler: &FileScheduler) -> Result<(Bytes, u64)> {
-        let file_size = scheduler.reader().size().await? as u64;
-        let begin = if file_size < scheduler.reader().block_size() as u64 {
+    async fn read_tail(io: &dyn FileReaderIo) -> Result<(Bytes, u64)> {
+        let file_size = io.file_size().await? as u64;
+        let begin = if file_size < io.metadata_read_size() as u64 {
             0
         } else {
-            file_size - scheduler.reader().block_size() as u64
+            file_size - io.metadata_read_size() as u64
         };
-        let tail_bytes = scheduler.submit_single(begin..file_size, 0).await?;
+        let tail_bytes = io.submit_single(begin..file_size, 0).await?;
         Ok((tail_bytes, file_size))
     }
 
@@ -471,7 +490,7 @@ impl FileReader {
     async fn optimistic_tail_read(
         data: &Bytes,
         start_pos: u64,
-        scheduler: &FileScheduler,
+        io: &dyn FileReaderIo,
         file_len: u64,
     ) -> Result<Bytes> {
         let num_bytes_needed = (file_len - start_pos) as usize;
@@ -480,7 +499,7 @@ impl FileReader {
         } else {
             let num_bytes_missing = (num_bytes_needed - data.len()) as u64;
             let start = file_len - num_bytes_needed as u64;
-            let missing_bytes = scheduler
+            let missing_bytes = io
                 .submit_single(start..start + num_bytes_missing, 0)
                 .await?;
             let mut combined = BytesMut::with_capacity(data.len() + num_bytes_missing as usize);
@@ -516,19 +535,15 @@ impl FileReader {
     async fn decode_gbo_table(
         tail_bytes: &Bytes,
         file_len: u64,
-        scheduler: &FileScheduler,
+        io: &dyn FileReaderIo,
         footer: &Footer,
         version: LanceFileVersion,
     ) -> Result<Vec<BufferDescriptor>> {
         // This could, in theory, trigger another IOP but the GBO table should never be large
         // enough for that to happen
-        let gbo_bytes = Self::optimistic_tail_read(
-            tail_bytes,
-            footer.global_buff_offsets_start,
-            scheduler,
-            file_len,
-        )
-        .await?;
+        let gbo_bytes =
+            Self::optimistic_tail_read(tail_bytes, footer.global_buff_offsets_start, io, file_len)
+                .await?;
         Self::do_decode_gbo_table(&gbo_bytes, footer, version)
     }
 
@@ -557,9 +572,9 @@ impl FileReader {
     //
     // Also, if the number of columns is fairly small, it's faster to read them as a
     // single IOP, but we can fix this through coalescing.
-    pub async fn read_all_metadata(scheduler: &FileScheduler) -> Result<CachedFileMetadata> {
+    pub async fn read_all_metadata(io: &dyn FileReaderIo) -> Result<CachedFileMetadata> {
         // 1. read the footer
-        let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
+        let (tail_bytes, file_len) = Self::read_tail(io).await?;
         let footer = Self::decode_footer(&tail_bytes)?;
 
         let file_version = LanceFileVersion::try_from_major_minor(
@@ -568,7 +583,7 @@ impl FileReader {
         )?;
 
         let gbo_table =
-            Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version).await?;
+            Self::decode_gbo_table(&tail_bytes, file_len, io, &footer, file_version).await?;
         if gbo_table.is_empty() {
             return Err(Error::Internal {
                 message: "File did not contain any global buffers, schema expected".to_string(),
@@ -583,7 +598,7 @@ impl FileReader {
         // By default we read all column metadatas.  We do NOT read the column metadata buffers
         // at this point.  We only want to read the column metadata for columns we are actually loading.
         let all_metadata_bytes =
-            Self::optimistic_tail_read(&tail_bytes, schema_start, scheduler, file_len).await?;
+            Self::optimistic_tail_read(&tail_bytes, schema_start, io, file_len).await?;
 
         let schema_bytes = all_metadata_bytes.slice(0..schema_size as usize);
         let (num_rows, schema) = Self::decode_schema(schema_bytes)?;
@@ -730,6 +745,8 @@ impl FileReader {
     ///
     /// A `base_projection` can also be provided.  If provided, then the projection will apply
     /// to all reads from the file that do not specify their own projection.
+    ///
+    /// Consider using the [`FileReaderBuilder`] for more flexibility and a simpler API.
     pub async fn try_open(
         scheduler: FileScheduler,
         base_projection: Option<ReaderProjection>,
@@ -737,10 +754,11 @@ impl FileReader {
         cache: &FileMetadataCache,
         options: FileReaderOptions,
     ) -> Result<Self> {
-        let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
         let path = scheduler.reader().path().clone();
+        let io = Arc::new(LanceEncodingsIo(scheduler));
+        let file_metadata = Arc::new(Self::read_all_metadata(io.as_ref()).await?);
         Self::try_open_with_file_metadata(
-            Arc::new(LanceEncodingsIo(scheduler)),
+            io,
             path,
             base_projection,
             decoder_plugins,
@@ -748,7 +766,6 @@ impl FileReader {
             cache,
             options,
         )
-        .await
     }
 
     /// Same as `try_open` but with the file metadata already loaded.
@@ -756,7 +773,9 @@ impl FileReader {
     /// This method also can accept any kind of `EncodingsIo` implementation allowing
     /// for custom strategies to be used for I/O scheduling (e.g. for takes on fast
     /// disks it may be better to avoid asynchronous overhead).
-    pub async fn try_open_with_file_metadata(
+    ///
+    /// Consider using the [`FileReaderBuilder`] for more flexibility and a simpler API.
+    pub fn try_open_with_file_metadata(
         scheduler: Arc<dyn EncodingsIo>,
         path: Path,
         base_projection: Option<ReaderProjection>,
@@ -1227,6 +1246,109 @@ impl FileReader {
 
     pub fn schema(&self) -> &Arc<Schema> {
         &self.metadata.file_schema
+    }
+}
+
+/// Builder for a [`FileReader`].
+pub struct FileReaderBuilder {
+    io: Arc<dyn FileReaderIo>,
+    path: Path,
+    base_projection: Option<ReaderProjection>,
+    decoder_plugins: Arc<DecoderPlugins>,
+    cache: FileMetadataCache,
+    options: FileReaderOptions,
+    file_metadata: Option<Arc<CachedFileMetadata>>,
+}
+
+impl FileReaderBuilder {
+    /// Create a new builder for a [`FileReader`] with a custom [`EncodingsIo`].
+    ///
+    /// This can be used to accommodate a wide variety of custom I/O strategies.
+    ///
+    /// A path is still required to use as a base name in the cache and for various
+    /// logging messages.  However, the path will only be used as an identifier and
+    /// does not need to have an actual file backing it.
+    pub fn new_custom(io: Arc<dyn FileReaderIo>, path: Path) -> Self {
+        Self {
+            io,
+            path,
+            base_projection: None,
+            decoder_plugins: Default::default(),
+            cache: FileMetadataCache::no_cache(),
+            options: FileReaderOptions::default(),
+            file_metadata: None,
+        }
+    }
+
+    /// Create a new builder for a [`FileReader`] from a [`FileScheduler`].
+    pub fn new_from_file(file: FileScheduler) -> Self {
+        let path = file.reader().path().clone();
+        let io = Arc::new(LanceEncodingsIo(file));
+        Self::new_custom(io, path)
+    }
+
+    /// Set the base projection for the [`FileReader`].
+    ///
+    /// This projection will be applied to all reads performed through the [`FileReader`].
+    /// if no other projection is specified.
+    pub fn with_base_projection(mut self, projection: ReaderProjection) -> Self {
+        self.base_projection = Some(projection);
+        self
+    }
+
+    /// Set the decoder plugins for the [`FileReader`].
+    ///
+    /// This allows for supplying custom decoders.
+    pub fn with_decoder_plugins(mut self, decoder_plugins: Arc<DecoderPlugins>) -> Self {
+        self.decoder_plugins = decoder_plugins;
+        self
+    }
+
+    /// Set the cache for the [`FileReader`].
+    ///
+    /// This cache will be used to store metadata about the file.  By default, no cache
+    /// is used.
+    pub fn with_cache(mut self, cache: FileMetadataCache) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// Set the options for the [`FileReader`].
+    pub fn with_options(mut self, options: FileReaderOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Set the file metadata for the [`FileReader`].
+    ///
+    /// This is used to supply pre-computed file metadata.  If not provided, the file
+    /// metadata will be read from the file when the [`FileReader`] is built.
+    ///
+    /// Using pre-computed metadata can significantly reduce I/O and is very useful when
+    /// performing many small reads over time.
+    pub fn with_file_metadata(mut self, file_metadata: Arc<CachedFileMetadata>) -> Self {
+        self.file_metadata = Some(file_metadata);
+        self
+    }
+
+    /// Build the [`FileReader`].
+    ///
+    /// This will read the file metadata from the file if not provided.
+    pub async fn build(self) -> Result<FileReader> {
+        let file_metadata = match self.file_metadata {
+            Some(file_metadata) => file_metadata,
+            None => Arc::new(FileReader::read_all_metadata(self.io.as_ref()).await?),
+        };
+
+        FileReader::try_open_with_file_metadata(
+            self.io.clone(),
+            self.path,
+            self.base_projection,
+            self.decoder_plugins,
+            file_metadata,
+            &self.cache,
+            self.options,
+        )
     }
 }
 

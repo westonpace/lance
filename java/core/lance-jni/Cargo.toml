@@ -23,7 +23,10 @@ lance-core.workspace = true
 lance-file.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
 arrow-schema.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
 datafusion.workspace = true
+futures.workspace = true
 object_store.workspace = true
 tokio.workspace = true
 jni = "0.21.1"
