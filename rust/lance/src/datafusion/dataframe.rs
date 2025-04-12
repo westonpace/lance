@@ -19,6 +19,7 @@ use datafusion::{
 };
 use lance_arrow::SchemaExt;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
+use tokio::runtime::Handle;
 
 use crate::Dataset;
 
@@ -28,10 +29,16 @@ pub struct LanceTableProvider {
     full_schema: Arc<Schema>,
     row_id_idx: Option<usize>,
     row_addr_idx: Option<usize>,
+    runtime: Option<Handle>,
 }
 
 impl LanceTableProvider {
-    pub fn new(dataset: Arc<Dataset>, with_row_id: bool, with_row_addr: bool) -> Self {
+    pub fn new(
+        dataset: Arc<Dataset>,
+        with_row_id: bool,
+        with_row_addr: bool,
+        runtime: Option<Handle>,
+    ) -> Self {
         let mut full_schema = Schema::from(dataset.schema());
         let mut row_id_idx = None;
         let mut row_addr_idx = None;
@@ -48,6 +55,7 @@ impl LanceTableProvider {
             full_schema: Arc::new(full_schema),
             row_id_idx,
             row_addr_idx,
+            runtime,
         }
     }
 }
@@ -104,6 +112,10 @@ impl TableProvider for LanceTableProvider {
             scan.filter_expr(combined_filter);
         }
         scan.limit(limit.map(|l| l as i64), None)?;
+
+        if let Some(handle) = &self.runtime {
+            scan.with_runtime(handle.clone());
+        }
 
         scan.create_plan().await.map_err(DataFusionError::from)
     }
@@ -186,6 +198,7 @@ impl SessionContextExt for SessionContext {
             dataset,
             with_row_id,
             with_row_addr,
+            None,
         )))
     }
 
@@ -236,7 +249,7 @@ pub mod tests {
 
         ctx.register_table(
             "foo",
-            Arc::new(LanceTableProvider::new(Arc::new(data), true, true)),
+            Arc::new(LanceTableProvider::new(Arc::new(data), true, true, None)),
         )
         .unwrap();
 

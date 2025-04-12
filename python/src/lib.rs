@@ -438,6 +438,7 @@ impl MyLanceTableProvider {
             dataset.clone(),
             false,
             false,
+            RT.get_runtime_handle(),
         ));
         println!("LanceTableProvider created");
 
@@ -456,6 +457,7 @@ impl MyLanceTableProvider {
             self.dataset.clone(),
             false,
             false,
+            RT.get_runtime_handle(),
         ));
         println!("LanceTableProvider created");
 

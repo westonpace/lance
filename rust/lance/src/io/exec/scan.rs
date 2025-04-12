@@ -30,6 +30,7 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
 use snafu::location;
+use tokio::runtime::Handle;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
 use crate::dataset::scanner::{
@@ -484,6 +485,7 @@ pub struct LanceScanExec {
     properties: PlanProperties,
     config: LanceScanConfig,
     metrics: ExecutionPlanMetricsSet,
+    runtime: Option<Handle>,
 }
 
 impl DisplayAs for LanceScanExec {
@@ -519,6 +521,7 @@ impl LanceScanExec {
         range: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
+        runtime: Option<Handle>,
     ) -> Self {
         let mut output_schema: ArrowSchema = projection.as_ref().into();
 
@@ -547,6 +550,7 @@ impl LanceScanExec {
             properties,
             config,
             metrics: ExecutionPlanMetricsSet::new(),
+            runtime,
         }
     }
 }
@@ -587,6 +591,11 @@ impl ExecutionPlan for LanceScanExec {
         partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let _guard = if let Some(handle) = &self.runtime {
+            Some(handle.enter())
+        } else {
+            None
+        };
         Ok(Box::pin(LanceStream::try_new(
             self.dataset.clone(),
             self.fragments.clone(),

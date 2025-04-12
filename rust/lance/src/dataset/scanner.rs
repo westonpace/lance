@@ -58,6 +58,7 @@ use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{Fragment, Index};
 use roaring::RoaringBitmap;
+use tokio::runtime::Handle;
 use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
@@ -290,6 +291,8 @@ pub struct Scanner {
     limit: Option<i64>,
     offset: Option<i64>,
 
+    runtime: Option<Handle>,
+
     /// If Some then results will be ordered by the provided ordering
     ///
     /// If there are multiple columns the the results will first be ordered
@@ -374,6 +377,7 @@ impl Scanner {
             with_row_address: false,
             ordered: true,
             fragments: None,
+            runtime: None,
             fast_search: false,
             use_scalar_index: true,
             include_deleted_rows: false,
@@ -484,6 +488,11 @@ impl Scanner {
     /// with applying early materialization to more (or all) columns.
     pub fn materialization_style(&mut self, style: MaterializationStyle) -> &mut Self {
         self.materialization_style = style;
+        self
+    }
+
+    pub fn with_runtime(&mut self, runtime: Handle) -> &mut Self {
+        self.runtime = Some(runtime);
         self
     }
 
@@ -2220,6 +2229,7 @@ impl Scanner {
             range,
             projection,
             config,
+            self.runtime.clone(),
         ))
     }
 

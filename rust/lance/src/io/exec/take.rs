@@ -629,6 +629,7 @@ mod tests {
             None,
             scan_schema,
             config,
+            None,
         ));
 
         let projection = dataset
@@ -674,6 +675,7 @@ mod tests {
             None,
             scan_schema,
             config,
+            None,
         ));
 
         let projection = dataset
@@ -791,6 +793,7 @@ mod tests {
             None,
             scan_schema,
             config,
+            None,
         ));
 
         let projection = dataset
@@ -844,6 +847,7 @@ mod tests {
             None,
             scan_schema,
             LanceScanConfig::default(),
+            None,
         ));
         assert!(TakeExec::try_new(dataset, input, projection).is_err());
     }
@@ -869,6 +873,7 @@ mod tests {
             None,
             input_schema,
             config,
+            None,
         ));
 
         assert_eq!(input.schema().field_names(), vec!["i", ROW_ID],);
