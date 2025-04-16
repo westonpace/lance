@@ -3,7 +3,8 @@
 
 <img width="257" alt="Lance Logo" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
-**Modern data lake built for AI & ML workflows. Lance combines classic data lake features (table operations, time travel, filter pushdown), with better support for multimodal data, the ability to run in embedded mode (no catalog needed), 100x faster random access, zero-cost column evolution (not just schema evolution), rich secondary indices, and more.<br/>**
+**Modern data lake built for AI & ML workflows. Lance combines classic data lake features (table operations, time travel, filter pushdown), with better support for multimodal data, the ability to run in embedded mode (no catalog needed), 100x faster random access, zero-cost column evolution (not just schema evolution), rich secondary indices, and more.<br/><br/>**
+
 **Compatible with Pandas, DuckDB, Polars, Pyarrow, and Ray with more integrations on the way.**
 
 <a href="https://lancedb.github.io/lance/">Documentation</a> •
@@ -47,6 +48,17 @@ The key features of Lance include:
 - **Zero-copy, automatic versioning:** manage snapshots and tags of your data without needing extra infrastructure.
 
 - **Ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Ray, Spark and more on the way.
+
+The following table summarizes the key features of Lance compared with other options.
+
+| Feature          | Lance             | WebDataset    | Iceberg / Delta Lake             | Parquet                          |
+| ---------------- | ----------------- | ------------- | -------------------------------- | -------------------------------- |
+| Random Access    | ✅ Fast           | ❌ No Support | ⚠️ Slow                          | ⚠️ Slow                          |
+| Fast Scan        | ✅ Yes            | ✅ Yes        | ✅ Yes                           | ✅ Yes                           |
+| Schema Evolution | ✅ Yes, zero-copy | ❌ No Support | ⚠️ Copy required for new columns | ⚠️ Copy required for new columns |
+| Multimodal       | ✅ Yes            | ✅ Yes        | ❌ No                            | ❌ No                            |
+| Search           | ✅ Yes            | ❌ No Support | ⚠️ Slow                          | ⚠️ Slow                          |
+| Analytics        | ✅ Fast           | ❌ No Support | ✅ Fast                          | ✅ Fast                          |
 
 > [!TIP]
 > Lance is in active development and we welcome contributions. Please see our [contributing guide](docs/contributing.rst) for more information.
@@ -180,16 +192,14 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 
 Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://lancedb.github.io/lance/format.html).
 
-**Vector index**: Vector index for similarity search over embedding space.
-Support both CPUs (`x86_64` and `arm`) and GPU (`Nvidia (cuda)` and `Apple Silicon (mps)`).
+**Vector index**: Lance includes a state of the art vector index implementation for
+similarity search over embedding space. Supports both CPUs (`x86_64` and `arm`) and GPU (`Nvidia (cuda)` and `Apple Silicon (mps)`).
 
-**Encodings**: To achieve both fast columnar scan and sub-linear point queries, Lance uses custom encodings and layouts.
+**Columnar + Random Access**: To achieve both fast columnar scan and sub-linear point queries, Lance uses a custom storage format that is optimized for both random access and sequential scans.
 
 **Nested fields**: Lance stores each subfield as a separate column to support efficient filters like “find images where detected objects include cats”.
 
-**Versioning**: A Manifest can be used to record snapshots. Currently we support creating new versions automatically via appends, overwrites, and index creation .
-
-**Fast updates** (ROADMAP): Updates will be supported via write-ahead logs.
+**Versioning**: All changes to the dataset are recorded as new versions, which can be used to restore the dataset to a previous state.
 
 **Rich secondary indices**: Support `BTree`, `Bitmap`, `Full text search`, `Label list`,
 `NGrams`, and more.
