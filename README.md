@@ -39,26 +39,16 @@ Lance is a modern data lake that is optimized for ML workflows and tables. Lance
 3. Running experiments by quickly adding and removing features without data copies.
 4. Storing, querying, and inspecting deeply nested data for robotics or large blobs like images, point clouds, and more.
 
-The key features of Lance include:
-
-- **High-performance random access:** 100x faster than other data lakes without sacrificing scan performance.
-
-- **Vector search:** find nearest neighbors in milliseconds and combine OLAP-queries with vector search.
-
-- **Zero-copy, automatic versioning:** manage snapshots and tags of your data without needing extra infrastructure.
-
-- **Ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Ray, Spark and more on the way.
-
 The following table summarizes the key features of Lance compared with other options.
 
-| Feature          | Lance             | WebDataset    | Iceberg / Delta Lake             | Parquet                          |
-| ---------------- | ----------------- | ------------- | -------------------------------- | -------------------------------- |
-| Random Access    | ✅ Fast           | ❌ No Support | ⚠️ Slow                          | ⚠️ Slow                          |
-| Fast Scan        | ✅ Yes            | ✅ Yes        | ✅ Yes                           | ✅ Yes                           |
-| Schema Evolution | ✅ Yes, zero-copy | ❌ No Support | ⚠️ Copy required for new columns | ⚠️ Copy required for new columns |
-| Multimodal       | ✅ Yes            | ✅ Yes        | ❌ No                            | ❌ No                            |
-| Search           | ✅ Yes            | ❌ No Support | ⚠️ Slow                          | ⚠️ Slow                          |
-| Analytics        | ✅ Fast           | ❌ No Support | ✅ Fast                          | ✅ Fast                          |
+| Feature          | Lance             | WebDataset    | Iceberg / Delta Lake        | Parquet                     |
+| ---------------- | ----------------- | ------------- | --------------------------- | --------------------------- |
+| Random Access    | ✅ Fast           | ❌ No Support | ⚠️ Slow                     | ⚠️ Slow                     |
+| Fast Scan        | ✅ Yes            | ✅ Yes        | ✅ Yes                      | ✅ Yes                      |
+| Schema Evolution | ✅ Yes, zero-copy | ❌ No Support | ⚠️ Copy table to add column | ⚠️ Copy table to add column |
+| Multimodal       | ✅ Yes            | ✅ Yes        | ❌ No                       | ❌ No                       |
+| Search           | ✅ Yes            | ❌ No Support | ⚠️ Slow                     | ⚠️ Slow                     |
+| Analytics        | ✅ Fast           | ❌ No Support | ✅ Fast                     | ✅ Fast                     |
 
 > [!TIP]
 > Lance is in active development and we welcome contributions. Please see our [contributing guide](docs/contributing.rst) for more information.
@@ -224,7 +214,7 @@ We create a Lance dataset using the Oxford Pet dataset to do some preliminary pe
 
 ![](docs/lance_perf.png)
 
-## Why are you building yet another data format?!
+## Why are you building yet another table format?!
 
 The machine learning development cycle involves the steps:
 
@@ -232,7 +222,7 @@ The machine learning development cycle involves the steps:
 graph LR
     A[Collection] --> B[Exploration];
     B --> C[Analytics];
-    C --> D[Feature Engineer];
+    C --> D[Feature Engineering];
     D --> E[Training];
     E --> F[Evaluation];
     F --> C;
@@ -241,28 +231,15 @@ graph LR
     H --> A;
 ```
 
-People use different data representations to varying stages for the performance or limited by the tooling available.
-Academia mainly uses XML / JSON for annotations and zipped images/sensors data for deep learning, which
-is difficult to integrated into data infrastructure and slow to train over cloud storage.
-While industry uses data lakes (Parquet-based techniques, i.e., Delta Lake, Iceberg) or data warehouses (AWS Redshift
-or Google BigQuery) to collect and analyze data, they have to convert the data into training-friendly formats, such
-as [Rikai](https://github.com/eto-ai/rikai)/[Petastorm](https://github.com/uber/petastorm)
-or [TFRecord](https://www.tensorflow.org/tutorials/load_data/tfrecord).
-Multiple single-purpose data transforms, as well as syncing copies between cloud storage to local training
-instances have become a common practice.
+Currently, people use different data representations at the various stages due to limited performance or tooling.
 
-While each of the existing data formats excels at the workload it was originally designed for, we need a new data format
-tailored for multistage ML development cycles to reduce and data silos.
+Academia mainly uses XML / JSON for annotations and zipped images/sensors data for deep learning, which is difficult to integrate into data infrastructure and slow to train over cloud storage.
 
-A comparison of different data formats in each stage of ML development cycle.
+Industry uses classic Parquet-based data lakes (e.g. Delta Lake, Iceberg) or data warehouses (e.g. AWS Redshift, Google BigQuery) to collect and analyze data. These have limited support for multimodal types, are difficult to experiment with, and are often slow or expensive when it comes to data exploration and search.
 
-|                     | Lance | Parquet & ORC | JSON & XML | TFRecord | Database | Warehouse |
-| ------------------- | ----- | ------------- | ---------- | -------- | -------- | --------- |
-| Analytics           | Fast  | Fast          | Slow       | Slow     | Decent   | Fast      |
-| Feature Engineering | Fast  | Fast          | Decent     | Slow     | Decent   | Good      |
-| Training            | Fast  | Decent        | Slow       | Fast     | N/A      | N/A       |
-| Exploration         | Fast  | Slow          | Fast       | Slow     | Fast     | Decent    |
-| Infra Support       | Rich  | Rich          | Decent     | Limited  | Rich     | Rich      |
+Multiple single-purpose data transforms, manually syncing copies between cloud storage to local training instances, and ad-hoc infrastructure has become a common practice.
+
+While each of the existing storage choices excels at the workload it was originally designed for, we need a new choice tailored for multistage ML development cycles to reduce costs, engineering overhead, and data silos.
 
 ## Community Highlights
 
