@@ -31,6 +31,7 @@ use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use tracing::instrument;
 
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
 use crate::dataset::rowids::get_row_id_index;
@@ -156,6 +157,7 @@ impl TakeStream {
         }
     }
 
+    #[instrument(name = "map_batch", level = "debug", skip_all)]
     async fn map_batch(
         self: Arc<Self>,
         batch: RecordBatch,

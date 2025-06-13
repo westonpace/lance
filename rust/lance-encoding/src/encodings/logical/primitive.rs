@@ -29,6 +29,7 @@ use lance_core::{
 };
 use log::{debug, trace};
 use snafu::location;
+use tracing::instrument;
 
 use crate::repdef::{
     build_control_word_iterator, CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser,
@@ -2512,6 +2513,7 @@ struct VariableFullZipDecodeTask {
 }
 
 impl DecodePageTask for VariableFullZipDecodeTask {
+    #[instrument(name = "variable_full_zip_decode_task", level = "debug", skip_all)]
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
         let block = VariableWidthBlock {
             data: self.data,

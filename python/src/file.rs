@@ -25,6 +25,7 @@ use lance_file::{
     v2::{
         reader::{
             BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions, FileStatistics,
+            ReaderProjection,
         },
         writer::{FileWriter, FileWriterOptions},
     },
@@ -508,6 +509,40 @@ impl LanceFileReader {
             batch_size,
             batch_readahead,
         )
+    }
+
+    pub fn take_rows_blocking(
+        &mut self,
+        row_indices: Vec<u64>,
+        batch_size: u32,
+        column_names: Option<Vec<String>>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let indices = row_indices
+            .into_iter()
+            .map(|idx| idx as u32)
+            .collect::<Vec<_>>();
+        let indices_arr = UInt32Array::from(indices);
+        let params = ReadBatchParams::Indices(indices_arr);
+        let schema = self.inner.schema();
+        let projection = column_names.map(|column_names| {
+            let column_names = column_names
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>();
+            ReaderProjection::from_column_names(LanceFileVersion::V2_1, schema, &column_names)
+                .unwrap()
+        });
+
+        let reader = self
+            .inner
+            .read_stream_projected_blocking(
+                params,
+                batch_size,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .infer_error()?;
+        Ok(PyArrowType(reader))
     }
 
     pub fn metadata(&mut self, py: Python) -> LanceFileMetadata {

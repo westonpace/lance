@@ -141,6 +141,20 @@ class LanceFileReader:
             self._reader.take_rows(indices, batch_size, batch_readahead)
         )
 
+    def take_rows_blocking(
+        self,
+        indices,
+        *,
+        batch_size: int = 1024,
+        column_names: Optional[list[str]] = None,
+    ) -> ReaderResults:
+        """
+        Read a specific set of rows from the file
+        """
+        return ReaderResults(
+            self._reader.take_rows_blocking(indices, batch_size, column_names)
+        )
+
     def metadata(self) -> LanceFileMetadata:
         """
         Return metadata describing the file contents

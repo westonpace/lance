@@ -41,6 +41,7 @@ use lance_io::{
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
     ReadBatchParams,
 };
+use tracing::instrument;
 
 use crate::{
     datatypes::{Fields, FieldsWithMeta},
@@ -1139,6 +1140,7 @@ impl FileReader {
         )))
     }
 
+    #[instrument(name = "take_rows_blocking", skip_all, level = "debug")]
     fn take_rows_blocking(
         &self,
         indices: Vec<u64>,

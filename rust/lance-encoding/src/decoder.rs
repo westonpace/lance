@@ -1641,10 +1641,8 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
             }
         }
 
-        let loaded_need = self.rows_drained + self.rows_per_batch as u64 - 1;
-
         self.root_decoder
-            .wait(loaded_need, &self.wait_for_io_runtime)?;
+            .wait(scheduled_need - 1, &self.wait_for_io_runtime)?;
         Ok(self.rows_scheduled)
     }
 

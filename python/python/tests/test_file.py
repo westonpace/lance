@@ -484,3 +484,16 @@ def test_blob(tmp_path):
         expected_bytes = expected.column("val").chunk(0)[row_num].as_py()
         assert len(actual_bytes) == len(expected_bytes)
         assert actual_bytes == expected_bytes
+
+
+def test_take_rows_blocking(tmp_path):
+    table = pa.table({"a": [1, 2, 3], "b": [4, 5, 6]})
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(table)
+    reader = LanceFileReader(str(path))
+    result = reader.take_rows_blocking([0, 2]).to_table()
+    assert result == pa.table({"a": [1, 3], "b": [4, 6]})
+
+    result = reader.take_rows_blocking([0, 2], column_names=["b"]).to_table()
+    assert result == pa.table({"b": [4, 6]})

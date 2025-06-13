@@ -21,6 +21,7 @@ use lance_core::utils::deletion::OffsetMapper;
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use snafu::location;
+use tracing::instrument;
 
 use super::ProjectionRequest;
 use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};
@@ -111,6 +112,7 @@ pub async fn take(
 }
 
 /// Take rows by the internal ROW ids.
+#[instrument(skip_all, level = "debug")]
 async fn do_take_rows(
     mut builder: TakeBuilder,
     projection: Arc<ProjectionPlan>,
@@ -258,6 +260,7 @@ async fn do_take_rows(
             .await?;
 
         let one_batch = if batches.len() > 1 {
+            let _span = tracing::span!(tracing::Level::DEBUG, "concat_batches").entered();
             concat_batches(&schema_with_row_addr, &batches)?
         } else {
             batches.pop().unwrap()
@@ -298,7 +301,10 @@ async fn do_take_rows(
         // so we need to handle it manually here.
         // TODO: remove this once the bug is fixed.
         let struct_arr: StructArray = one_batch.into();
-        let reordered = take_struct_array(&struct_arr, &remapping_index)?;
+        let reordered = {
+            let _span = tracing::span!(tracing::Level::DEBUG, "take_struct_array").entered();
+            take_struct_array(&struct_arr, &remapping_index)?
+        };
         Ok(reordered.into())
     }?;
 
