@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, OffsetSizeTrait};
 use arrow_buffer::{bit_util, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use bytemuck::{cast_slice, try_cast_slice};
 use byteorder::{ByteOrder, LittleEndian};
@@ -531,10 +531,10 @@ impl ArrayEncoder for BinaryEncoder {
 #[derive(Debug, Default)]
 pub struct BinaryMiniBlockEncoder {}
 
-const AIM_MINICHUNK_SIZE: u64 = 4 * 1024;
+const AIM_MINICHUNK_SIZE: i64 = 4 * 1024;
 
 // Make it to support both u32 and u64
-fn chunk_offsets<N: num_traits::PrimInt + num_traits::Unsigned + bytemuck::Pod>(
+fn chunk_offsets<N: OffsetSizeTrait>(
     offsets: &[N],
     // auto deduce from offsets?
     offset_size /*the number of bytes in the type from offsets */: usize,
@@ -603,11 +603,12 @@ fn chunk_offsets<N: num_traits::PrimInt + num_traits::Unsigned + bytemuck::Pod>(
             .iter()
             .map(|offset| {
                 *offset - offsets[chunk.chunk_start_offset_in_orig_idx]
-                    + N::from(chunk.bytes_start_offset).unwrap()
+                    + N::from_usize(chunk.bytes_start_offset).unwrap()
             })
             .collect();
 
-        output.extend_from_slice(bytemuck::cast_slice(&this_chunk_offsets));
+        let this_chunk_offsets = LanceBuffer::reinterpret_vec(this_chunk_offsets);
+        output.extend_from_slice(&this_chunk_offsets);
 
         let start_in_orig = offsets[chunk.chunk_start_offset_in_orig_idx]
             .to_usize()
@@ -636,7 +637,7 @@ fn chunk_offsets<N: num_traits::PrimInt + num_traits::Unsigned + bytemuck::Pod>(
 // each time multiplies the number of values by 2.
 // It returns the offset_idx in `offsets` that belongs to this chunk.
 
-fn search_next_offset_idx<N: num_traits::PrimInt + num_traits::Unsigned + bytemuck::Pod>(
+fn search_next_offset_idx<N: OffsetSizeTrait>(
     offsets: &[N],
     offset_size: usize,
     last_offset_idx: usize,
@@ -647,9 +648,9 @@ fn search_next_offset_idx<N: num_traits::PrimInt + num_traits::Unsigned + bytemu
         if last_offset_idx + new_num_values >= offsets.len() {
             let existing_bytes = offsets[offsets.len() - 1] - offsets[last_offset_idx];
             // existing bytes plus the new offset size
-            let new_size =
-                existing_bytes + N::from((offsets.len() - last_offset_idx) * offset_size).unwrap();
-            if new_size.to_u64().unwrap() <= AIM_MINICHUNK_SIZE {
+            let new_size = existing_bytes
+                + N::from_usize((offsets.len() - last_offset_idx) * offset_size).unwrap();
+            if new_size.to_i64().unwrap() <= AIM_MINICHUNK_SIZE {
                 // case 1: can fit the rest of all data into a miniblock
                 return offsets.len() - 1;
             } else {
@@ -658,8 +659,8 @@ fn search_next_offset_idx<N: num_traits::PrimInt + num_traits::Unsigned + bytemu
             }
         }
         let existing_bytes = offsets[last_offset_idx + new_num_values] - offsets[last_offset_idx];
-        let new_size = existing_bytes + N::from((new_num_values + 1) * offset_size).unwrap();
-        if new_size.to_u64().unwrap() <= AIM_MINICHUNK_SIZE {
+        let new_size = existing_bytes + N::from_usize((new_num_values + 1) * offset_size).unwrap();
+        if new_size.to_i64().unwrap() <= AIM_MINICHUNK_SIZE {
             num_values = new_num_values;
             new_num_values *= 2;
         } else {
@@ -681,7 +682,7 @@ impl BinaryMiniBlockEncoder {
         //assert!(data.bits_per_offset == 32);
         match data.bits_per_offset {
             32 => {
-                let offsets = data.offsets.borrow_to_typed_slice::<u32>();
+                let offsets = data.offsets.borrow_to_typed_slice::<i32>();
                 let (buffers, chunks) = chunk_offsets(offsets.as_ref(), 4, &data.data, 4);
                 (
                     MiniBlockCompressed {
@@ -693,7 +694,7 @@ impl BinaryMiniBlockEncoder {
                 )
             }
             64 => {
-                let offsets = data.offsets.borrow_to_typed_slice::<u64>();
+                let offsets = data.offsets.borrow_to_typed_slice::<i64>();
                 let (buffers, chunks) = chunk_offsets(offsets.as_ref(), 8, &data.data, 8);
                 (
                     MiniBlockCompressed {
