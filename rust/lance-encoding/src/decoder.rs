@@ -831,10 +831,12 @@ impl CoreFieldDecoderStrategy {
             }
             DataType::LargeBinary | DataType::LargeUtf8 => {
                 let column_info = column_infos.expect_next()?;
-                let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
+                let mut scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                     column_info.as_ref(),
                     self.decompressor_strategy.as_ref(),
                 )?);
+                // TODO: Store that this is a 64-bit field
+                // scheduler.set_bits_per_offset(64);
                 column_infos.next_top_level();
                 Ok(scheduler)
             }

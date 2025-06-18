@@ -736,9 +736,9 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
         assert_eq!(data.len(), 1);
         let data = data.into_iter().next().unwrap();
         // Use the starting offset and num_values to detect 32 or 64 bits
-        let is_64bit = data.len() >= (num_values + 1) as usize * 8;
+        let is_64bit = data.len() >= (num_values + 1) as usize * 8 && data.len() % 8 == 0;
         // DELETE ME
-        //println!("is_64bit? {}", is_64bit);
+        // println!("is_64bit? {}", is_64bit);
         if is_64bit {
             // offset and at least one value
             assert!(data.len() >= 16);
