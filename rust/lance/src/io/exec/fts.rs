@@ -12,10 +12,8 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
-use datafusion_physical_plan::metrics::BaselineMetrics;
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
@@ -40,14 +38,12 @@ use super::PreFilterSource;
 
 pub struct FtsIndexMetrics {
     index_metrics: IndexMetrics,
-    baseline_metrics: BaselineMetrics,
 }
 
 impl FtsIndexMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             index_metrics: IndexMetrics::new(metrics, partition),
-            baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
 }
@@ -210,7 +206,6 @@ impl ExecutionPlan for MatchQueryExec {
             query.terms
         )))?;
         let stream = stream::once(async move {
-            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let index_meta = ds
                 .load_scalar_index(
                     ScalarIndexCriteria::default()
@@ -272,7 +267,6 @@ impl ExecutionPlan for MatchQueryExec {
             scores.iter_mut().for_each(|s| {
                 *s *= query.boost;
             });
-            metrics.baseline_metrics.record_output(doc_ids.len());
 
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
@@ -284,9 +278,11 @@ impl ExecutionPlan for MatchQueryExec {
             Ok::<_, DataFusionError>(batch)
         });
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
             stream.stream_in_current_span().boxed(),
+            partition,
+            &self.metrics,
         )))
     }
 
@@ -394,7 +390,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
-        let metrics_clone = metrics.clone();
         let unindexed_input = self.unindexed_input.execute(partition, context)?;
 
         let column = query.column.ok_or(DataFusionError::Execution(format!(
@@ -434,15 +429,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 inverted_idx,
             ))
         })
-        .try_flatten_unordered(None)
-        .map(move |batch| {
-            if let Ok(batch) = &batch {
-                metrics_clone
-                    .baseline_metrics
-                    .record_output(batch.num_rows());
-            }
-            batch
-        });
+        .try_flatten_unordered(None);
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
             stream.stream_in_current_span().boxed(),
@@ -596,7 +583,6 @@ impl ExecutionPlan for PhraseQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
-            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let column = query.column.ok_or(DataFusionError::Execution(format!(
                 "column not set for PhraseQuery {}",
                 query.terms
@@ -649,7 +635,6 @@ impl ExecutionPlan for PhraseQueryExec {
                 )
                 .boxed()
                 .await?;
-            metrics.baseline_metrics.record_output(doc_ids.len());
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
                 vec![
@@ -659,9 +644,11 @@ impl ExecutionPlan for PhraseQueryExec {
             )?;
             Ok::<_, DataFusionError>(batch)
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
             stream.stream_in_current_span().boxed(),
+            partition,
+            &self.metrics,
         )))
     }
 
@@ -788,12 +775,10 @@ impl ExecutionPlan for BoostQueryExec {
         let params = self.params.clone();
         let positive = self.positive.execute(partition, context.clone())?;
         let negative = self.negative.execute(partition, context)?;
-        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let positive = positive.try_collect::<Vec<_>>().await?;
             let negative = negative.try_collect::<Vec<_>>().await?;
 
-            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let mut res = HashMap::new();
             for batch in positive {
                 let doc_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
@@ -819,7 +804,6 @@ impl ExecutionPlan for BoostQueryExec {
                 .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
                 .take(params.limit.unwrap_or(usize::MAX))
                 .unzip();
-            metrics.baseline_metrics.record_output(doc_ids.len());
 
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
@@ -830,9 +814,11 @@ impl ExecutionPlan for BoostQueryExec {
             )?;
             Ok::<_, DataFusionError>(batch)
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
             stream.stream_in_current_span().boxed(),
+            partition,
+            &self.metrics,
         )))
     }
 
@@ -1003,16 +989,12 @@ impl ExecutionPlan for BooleanQueryExec {
             .transpose()?;
         let mut should = self.should.execute(partition, context.clone())?;
         let mut must_not = self.must_not.execute(partition, context)?;
-        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
-            let elapsed_time = metrics.baseline_metrics.elapsed_compute();
-
             let mut res = HashMap::new();
             let has_must = must.is_some();
             if let Some(mut must) = must {
                 while let Some(batch) = must.try_next().await? {
-                    let _timer = elapsed_time.timer();
                     let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
                     let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
                     res.extend(std::iter::zip(
@@ -1024,7 +1006,6 @@ impl ExecutionPlan for BooleanQueryExec {
 
             // add the scores from the should clause
             while let Some(batch) = should.try_next().await? {
-                let _timer = elapsed_time.timer();
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
                 let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
 
@@ -1038,7 +1019,6 @@ impl ExecutionPlan for BooleanQueryExec {
 
             // remove the results from the must_not clause
             while let Some(batch) = must_not.try_next().await? {
-                let _timer = elapsed_time.timer();
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
                 for row_id in row_ids {
                     res.remove(row_id);
@@ -1046,13 +1026,11 @@ impl ExecutionPlan for BooleanQueryExec {
             }
 
             // sort the results and take the top k
-            let _timer = elapsed_time.timer();
             let (row_ids, scores): (Vec<_>, Vec<_>) = res
                 .into_iter()
                 .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
                 .take(params.limit.unwrap_or(usize::MAX))
                 .unzip();
-            metrics.baseline_metrics.record_output(row_ids.len());
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
                 vec![
@@ -1062,9 +1040,11 @@ impl ExecutionPlan for BooleanQueryExec {
             )?;
             Ok::<_, DataFusionError>(batch)
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
             stream.stream_in_current_span().boxed(),
+            partition,
+            &self.metrics,
         )))
     }
 
