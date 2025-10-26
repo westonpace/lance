@@ -232,7 +232,7 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
 use lance_core::{ArrowResult, Error, Result};
-use tracing::instrument;
+use tracing::{info_span, instrument, Instrument};
 
 use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
@@ -1381,7 +1381,7 @@ impl BatchDecodeStream {
         Ok(scheduled_need)
     }
 
-    #[instrument(level = "debug", skip_all)]
+    #[instrument(level = "info", skip_all)]
     async fn next_batch_task(&mut self) -> Result<Option<NextDecodeTask>> {
         trace!(
             "Draining batch task (rows_remaining={} rows_drained={} rows_scheduled={})",
@@ -1539,12 +1539,16 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
     ///
     /// If the data is not available this will perform a *blocking* wait (put
     /// the current thread to sleep)
+    #[instrument(skip_all, level = "info", name = "wait_for_page")]
     fn wait_for_page(&self, unloaded_page: UnloadedPageShard) -> Result<LoadedPageShard> {
         match maybe_done(unloaded_page.0) {
             // Fast path, avoid all runtime shenanigans if the data is ready
             MaybeDone::Done(loaded_page) => loaded_page,
             // Slow path, we need to wait on I/O, enter the runtime
-            MaybeDone::Future(fut) => self.wait_for_io_runtime.block_on(fut),
+            MaybeDone::Future(fut) => {
+                let _span = info_span!("inner_wait_for_page").entered();
+                self.wait_for_io_runtime.block_on(fut)
+            }
             MaybeDone::Gone => unreachable!(),
         }
     }
@@ -1583,7 +1587,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
         Ok(self.rows_scheduled)
     }
 
-    #[instrument(level = "debug", skip_all)]
+    #[instrument(name = "next_batch_task2", level = "debug", skip_all)]
     fn next_batch_task(&mut self) -> Result<Option<RecordBatch>> {
         trace!(
             "Draining batch task (rows_remaining={} rows_drained={} rows_scheduled={})",
@@ -1684,19 +1688,28 @@ impl StructuralBatchDecodeStream {
         }
     }
 
+    #[instrument(skip_all)]
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<u64> {
         if self.scheduler_exhausted {
             return Ok(self.rows_scheduled);
         }
         while self.rows_scheduled < scheduled_need {
-            let next_message = self.context.source.recv().await;
+            let next_message = self
+                .context
+                .source
+                .recv()
+                .instrument(info_span!("channel_wait"))
+                .await;
             match next_message {
                 Some(scan_line) => {
                     let scan_line = scan_line?;
                     self.rows_scheduled = scan_line.scheduled_so_far;
                     for message in scan_line.decoders {
                         let unloaded_page = message.into_structural();
-                        let loaded_page = unloaded_page.0.await?;
+                        let loaded_page = unloaded_page
+                            .0
+                            .instrument(info_span!("wait_for_page"))
+                            .await?;
                         self.root_decoder.accept_page(loaded_page)?;
                     }
                 }
@@ -1712,7 +1725,7 @@ impl StructuralBatchDecodeStream {
         Ok(scheduled_need)
     }
 
-    #[instrument(level = "debug", skip_all)]
+    #[instrument(name = "next_batch_task3", level = "debug", skip_all)]
     async fn next_batch_task(&mut self) -> Result<Option<NextDecodeTask>> {
         trace!(
             "Draining batch task (rows_remaining={} rows_drained={} rows_scheduled={})",
@@ -1898,6 +1911,7 @@ pub fn create_decode_iterator(
     }
 }
 
+#[instrument(skip_all)]
 fn create_scheduler_decoder(
     column_infos: Vec<Arc<ColumnInfo>>,
     requested_rows: RequestedRows,
@@ -2435,9 +2449,12 @@ impl NextDecodeTask {
     //
     // If the batch is very large this function will log a warning message
     // suggesting the user try a smaller batch size.
-    #[instrument(name = "task_to_batch", level = "debug", skip_all)]
+    #[instrument(name = "task_to_batch", level = "info", skip_all)]
     fn into_batch(self, emitted_batch_size_warning: Arc<Once>) -> Result<RecordBatch> {
-        let struct_arr = self.task.decode();
+        let struct_arr = {
+            let _span = info_span!("batch_decode").entered();
+            self.task.decode()
+        };
         match struct_arr {
             Ok(struct_arr) => {
                 let batch = RecordBatch::from(struct_arr.as_struct());

@@ -36,6 +36,7 @@ use lance_core::{
 };
 use log::trace;
 use snafu::location;
+use tracing::{info_span, instrument, Instrument};
 
 use crate::{
     compression::{
@@ -511,6 +512,7 @@ impl DecodeMiniBlockTask {
 }
 
 impl DecodePageTask for DecodeMiniBlockTask {
+    #[instrument(skip_all, name = "decode_mini_block", level = "info")]
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
         // First, we create output buffers for the rep and def and data
         let mut repbuf: Option<LevelBuffer> = None;
@@ -1623,7 +1625,10 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             let (rep_index_pos, rep_index_size) = self.buffer_offsets_and_sizes.last().unwrap();
             required_ranges.push(*rep_index_pos..*rep_index_pos + *rep_index_size);
         }
-        let io_req = io.submit_request(required_ranges, 0);
+        let io_req = {
+            let _span = info_span!("miniblock_init").entered();
+            io.submit_request(required_ranges, 0)
+        };
 
         async move {
             let mut buffers = io_req.await?.into_iter().fuse();
@@ -1709,6 +1714,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         );
     }
 
+    #[instrument(skip_all, name = "sched_mini_block")]
     fn schedule_ranges(
         &self,
         ranges: &[Range<u64>],
@@ -1740,7 +1746,11 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .iter()
             .map(|c| c.byte_range.clone())
             .collect::<Vec<_>>();
-        let loaded_chunk_data = io.submit_request(chunk_ranges, self.priority);
+
+        let loaded_chunk_data = {
+            let _span = info_span!("mini_block_sched_submit").entered();
+            io.submit_request(chunk_ranges, self.priority)
+        };
 
         let rep_decompressor = self.rep_decompressor.clone();
         let def_decompressor = self.def_decompressor.clone();
@@ -2086,10 +2096,14 @@ impl FullZipScheduler {
                 cached_state.as_ref(),
                 priority,
             )
+            .instrument(info_span!("resolve_byte_ranges"))
             .await?;
 
             // Step 2: Load data
-            let data = io_clone.submit_request(byte_ranges, priority).await?;
+            let data = io_clone
+                .submit_request(byte_ranges, priority)
+                .instrument(info_span!("data_load"))
+                .await?;
             let data = data
                 .into_iter()
                 .map(|d| LanceBuffer::from_bytes(d, 1))
@@ -2188,6 +2202,7 @@ impl CachedPageData for FullZipCacheableState {
 impl StructuralPageScheduler for FullZipScheduler {
     /// Initializes the scheduler. If there's a repetition index, loads and caches it.
     /// Otherwise returns NoCachedPageData.
+    #[instrument(skip_all, name = "full_zip_init")]
     fn initialize<'a>(
         &'a mut self,
         io: &Arc<dyn EncodingsIo>,
@@ -2465,6 +2480,7 @@ impl VariableFullZipDecoder {
         }
     }
 
+    #[instrument(skip_all, level = "info")]
     fn unzip(
         &mut self,
         data: VecDeque<LanceBuffer>,
@@ -2632,6 +2648,7 @@ struct VariableFullZipDecodeTask {
 }
 
 impl DecodePageTask for VariableFullZipDecodeTask {
+    #[instrument(skip_all, level = "info", name = "var_full_zip_decode")]
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
         let block = VariableWidthBlock {
             data: self.data,
@@ -3167,6 +3184,7 @@ impl StructuralCompositeDecodeArrayTask {
 }
 
 impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
+    #[instrument(skip_all, level = "info", name = "primitive_decode")]
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
         let mut arrays = Vec::with_capacity(self.tasks.len());
         let mut unravelers = Vec::with_capacity(self.tasks.len());

@@ -21,6 +21,7 @@ use lance_core::utils::deletion::OffsetMapper;
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use snafu::location;
+use tracing::{info_span, instrument, Instrument};
 
 use super::ProjectionRequest;
 use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};
@@ -113,7 +114,9 @@ pub async fn take(
     }
 
     // First, convert the dataset offsets into row addresses
-    let addrs = row_offsets_to_row_addresses(dataset, offsets).await?;
+    let addrs = row_offsets_to_row_addresses(dataset, offsets)
+        .instrument(info_span!("off_to_addr"))
+        .await?;
 
     let builder = TakeBuilder::try_new_from_addresses(
         Arc::new(dataset.clone()),
@@ -243,27 +246,30 @@ async fn do_take_rows(
         Ok(concat_batches(&batches[0].schema(), &batches)?)
     } else {
         // Slow case: need to re-map data into expected order
-        let mut sorted_row_addrs = row_addrs.clone();
-        sorted_row_addrs.sort();
-        // Go ahead and dedup, we will reinsert duplicates during the remapping
-        sorted_row_addrs.dedup();
-        // Group ROW Ids by the fragment
         let mut row_addrs_per_fragment: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-        sorted_row_addrs.iter().for_each(|row_addr| {
-            let row_addr = RowAddress::from(*row_addr);
-            let fragment_id = row_addr.fragment_id();
-            let offset = row_addr.row_offset();
-            row_addrs_per_fragment
-                .entry(fragment_id)
-                .and_modify(|v| v.push(offset))
-                .or_insert_with(|| vec![offset]);
-        });
+        let fragment_and_indices = {
+            let _span = info_span!("prep_addrs").entered();
+            let mut sorted_row_addrs = row_addrs.clone();
+            sorted_row_addrs.sort();
+            // Go ahead and dedup, we will reinsert duplicates during the remapping
+            sorted_row_addrs.dedup();
+            // Group ROW Ids by the fragment
+            sorted_row_addrs.iter().for_each(|row_addr| {
+                let row_addr = RowAddress::from(*row_addr);
+                let fragment_id = row_addr.fragment_id();
+                let offset = row_addr.row_offset();
+                row_addrs_per_fragment
+                    .entry(fragment_id)
+                    .and_modify(|v| v.push(offset))
+                    .or_insert_with(|| vec![offset]);
+            });
 
-        let fragments = builder.dataset.get_fragments();
-        let fragment_and_indices = fragments.into_iter().filter_map(|f| {
-            let row_offset = row_addrs_per_fragment.remove(&(f.id() as u32))?;
-            Some((f, row_offset))
-        });
+            let fragments = builder.dataset.get_fragments();
+            fragments.into_iter().filter_map(|f| {
+                let row_offset = row_addrs_per_fragment.remove(&(f.id() as u32))?;
+                Some((f, row_offset))
+            })
+        };
 
         let mut batches = futures::stream::iter(fragment_and_indices)
             .map(|(fragment, indices)| {
@@ -278,49 +284,56 @@ async fn do_take_rows(
             .buffered(builder.dataset.object_store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
-        let one_batch = if batches.len() > 1 {
-            concat_batches(&batches[0].schema(), &batches)?
-        } else {
-            batches.pop().unwrap()
-        };
-        // Note: one_batch may contains fewer rows than the number of requested
-        // row ids because some rows may have been deleted. Because of this, we
-        // get the results with row ids so that we can re-order the results
-        // to match the requested order.
+        {
+            let _span = info_span!("reorder_rows").entered();
+            let one_batch = if batches.len() > 1 {
+                concat_batches(&batches[0].schema(), &batches)?
+            } else {
+                batches.pop().unwrap()
+            };
+            // Note: one_batch may contains fewer rows than the number of requested
+            // row ids because some rows may have been deleted. Because of this, we
+            // get the results with row ids so that we can re-order the results
+            // to match the requested order.
 
-        let returned_row_addr = one_batch
-            .column_by_name(ROW_ADDR)
-            .ok_or_else(|| Error::Internal {
-                message: "_rowaddr column not found".into(),
-                location: location!(),
-            })?
-            .as_primitive::<UInt64Type>()
-            .values();
+            let returned_row_addr = one_batch
+                .column_by_name(ROW_ADDR)
+                .ok_or_else(|| Error::Internal {
+                    message: "_rowaddr column not found".into(),
+                    location: location!(),
+                })?
+                .as_primitive::<UInt64Type>()
+                .values();
 
-        let remapping_index: UInt64Array = row_addrs
-            .iter()
-            .filter_map(|o| {
-                returned_row_addr
-                    .iter()
-                    .position(|id| id == o)
-                    .map(|pos| pos as u64)
-            })
-            .collect();
+            let remapping_index: UInt64Array = row_addrs
+                .iter()
+                .filter_map(|o| {
+                    returned_row_addr
+                        .iter()
+                        .position(|id| id == o)
+                        .map(|pos| pos as u64)
+                })
+                .collect();
 
-        // remapping_index may be greater than the number of rows in one_batch
-        // if there are duplicates in the requested row ids. This is expected.
-        debug_assert!(remapping_index.len() >= one_batch.num_rows());
+            // remapping_index may be greater than the number of rows in one_batch
+            // if there are duplicates in the requested row ids. This is expected.
+            debug_assert!(remapping_index.len() >= one_batch.num_rows());
 
-        // There's a bug in arrow_select::take::take, that it doesn't handle empty struct correctly,
-        // so we need to handle it manually here.
-        // TODO: remove this once the bug is fixed.
-        let struct_arr: StructArray = one_batch.into();
-        let reordered = take_struct_array(&struct_arr, &remapping_index)?;
-        Ok(reordered.into())
+            // There's a bug in arrow_select::take::take, that it doesn't handle empty struct correctly,
+            // so we need to handle it manually here.
+            // TODO: remove this once the bug is fixed.
+            let struct_arr: StructArray = one_batch.into();
+            let reordered = take_struct_array(&struct_arr, &remapping_index)?;
+            Ok(reordered.into())
+        }
     }?;
 
-    let batch = projection.project_batch(batch).await?;
+    let batch = projection
+        .project_batch(batch)
+        .instrument(info_span!("project_batch"))
+        .await?;
     if builder.with_row_address {
+        let _span = info_span!("add_row_addr").entered();
         if batch.num_rows() != row_addrs.len() {
             return Err(Error::NotSupported  {
             source: format!(
@@ -390,6 +403,7 @@ struct RowAddressStats {
     contiguous: bool,
 }
 
+#[instrument(skip_all, level = "info")]
 fn check_row_addrs(row_addrs: &[u64]) -> RowAddressStats {
     let mut sorted = true;
     let mut contiguous = true;

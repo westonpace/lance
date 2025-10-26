@@ -17,6 +17,7 @@
 
 use lance_core::{Error, Result};
 use snafu::location;
+use tracing::instrument;
 
 use crate::{
     buffer::LanceBuffer,
@@ -196,6 +197,7 @@ impl FsstPerValueDecompressor {
 }
 
 impl VariablePerValueDecompressor for FsstPerValueDecompressor {
+    #[instrument(skip_all, level = "debug", name = "fsst_fpr_decompress")] // # spellchecker:disable-line
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         // Step 1. Run inner decompressor
         let compressed_variable_data = self
@@ -296,6 +298,7 @@ impl FsstMiniBlockDecompressor {
 }
 
 impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
+    #[instrument(skip_all, level = "info", name = "mini_fsst_decompress")]
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         // Step 1. decompress data use `BinaryMiniBlockDecompressor`
         // Extract the bits_per_offset from the binary encoding

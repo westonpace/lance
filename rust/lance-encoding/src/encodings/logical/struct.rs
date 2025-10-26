@@ -29,6 +29,7 @@ use lance_arrow::FieldExt;
 use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
 use lance_core::Result;
 use log::trace;
+use tracing::instrument;
 
 use super::{list::StructuralListDecoder, primitive::StructuralPrimitiveFieldDecoder};
 
@@ -326,6 +327,7 @@ struct RepDefStructDecodeTask {
 }
 
 impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
+    #[instrument(skip_all, level = "info", name = "struct_decode")]
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
         if self.children.is_empty() {
             return Ok(DecodedArray {

@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
+use tracing::instrument;
 
 use lance_core::{Error, Result};
 
@@ -296,6 +297,7 @@ impl IoQueue {
             task.priority >> 64,
             task.priority & 0xFFFFFFFFFFFFFFFF
         );
+        tracing::info!("push io task");
         let mut state = self.state.lock().unwrap();
         state.pending_requests.push(task);
         drop(state);
@@ -472,6 +474,7 @@ impl IoTask {
     }
 
     async fn run(self) {
+        tracing::info!("start io task");
         let file_path = self.reader.path().as_ref();
         let num_bytes = self.num_bytes();
         let bytes = if self.to_read.start == self.to_read.end {
@@ -506,12 +509,14 @@ impl IoTask {
 // Every time a scheduler starts up it launches a task to run the I/O loop.  This loop
 // repeats endlessly until the scheduler is destroyed.
 async fn run_io_loop(tasks: Arc<IoQueue>) {
+    tracing::info!("start io loop");
     // Pop the first finished task off the queue and submit another until
     // we are done
     loop {
         let next_task = tasks.pop().await;
         match next_task {
             Some(task) => {
+                tracing::info!("spawn io task");
                 tokio::spawn(task.run());
             }
             None => {
@@ -805,6 +810,7 @@ impl FileScheduler {
     /// Each request has a backpressure ID which controls which backpressure throttle
     /// is applied to the request.  Requests made to the same backpressure throttle
     /// will be throttled together.
+    #[instrument(skip_all)]
     pub fn submit_request(
         &self,
         request: Vec<Range<u64>>,
