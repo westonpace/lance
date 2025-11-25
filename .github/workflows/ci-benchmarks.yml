@@ -61,9 +61,6 @@ jobs:
                       results.json python/ci_benchmarks"
   bench_io:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: rust/lance-io
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -72,6 +69,7 @@ jobs:
           cargo remove --dev criterion
           cargo add --dev codspeed-criterion-compat --rename criterion
       - name: Build
+        working-directory: rust/lance-io
         run: |
           cargo codspeed build
       - name: Run benchmarks
