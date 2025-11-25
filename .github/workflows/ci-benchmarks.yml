@@ -58,3 +58,24 @@ jobs:
           bencher run --project weston-lancedb --token ${{ secrets.LANCE_BENCHER_TOKEN }} --adapter python_pytest \
                       --branch main --testbed google-genoa --err --file results.json "python -mpytest --benchmark-json \
                       results.json python/ci_benchmarks"
+  bench_io:
+    runs-on: ubuntu-24.04-arm64-4x
+    defaults:
+      run:
+        working-directory: rust/lance-io
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Codspeed
+        run: |
+          cargo remove --dev criterion
+          cargo add --dev codspeed-criterion-compat --rename criterion
+      - name: Build
+        run: |
+          cargo codspeed build
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v4
+        with:
+          run: cargo codspeed run
+          mode: simulation
+          working-directory: rust/lance-io
