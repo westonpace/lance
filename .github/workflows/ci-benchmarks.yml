@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - ci/codspeed-lance-io
 
 jobs:
   bench_regress:
@@ -59,7 +60,7 @@ jobs:
                       --branch main --testbed google-genoa --err --file results.json "python -mpytest --benchmark-json \
                       results.json python/ci_benchmarks"
   bench_io:
-    runs-on: ubuntu-24.04-arm64-4x
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: rust/lance-io
