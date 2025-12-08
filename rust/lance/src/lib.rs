@@ -107,4 +107,5 @@ pub mod deps {
     pub use arrow_array;
     pub use arrow_schema;
     pub use datafusion;
+    pub use lance_file;
 }

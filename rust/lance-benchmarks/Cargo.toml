@@ -1,0 +1,38 @@
+[package]
+name = "lance-benchmarks"
+version = "1.1.0-beta.2"
+edition = "2021"
+authors = ["Lance Devs <dev@lance.org>"]
+rust-version = "1.80"
+publish = false
+
+[dependencies]
+lance = { path = "../lance" }
+arrow = "56.1"
+arrow-array = "56.1"
+arrow-schema = "56.1"
+tokio = { version = "1.23", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "sync",
+] }
+rand = "0.9"
+futures = "0.3"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = [
+    "async",
+    "async_tokio",
+    "html_reports",
+] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pprof = { version = "0.14.0", features = ["flamegraph", "criterion"] }
+
+[[bench]]
+name = "take"
+harness = false
+
+[workspace]
+members = []
