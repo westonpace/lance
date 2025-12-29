@@ -37,6 +37,7 @@ chrono.workspace = true
 deepsize.workspace = true
 futures.workspace = true
 log.workspace = true
+moka.workspace = true
 pin-project.workspace = true
 prost.workspace = true
 serde.workspace = true
@@ -48,12 +49,17 @@ url.workspace = true
 path_abs.workspace = true
 rand.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+io-uring = { workspace = true }
+
 [dev-dependencies]
 criterion.workspace = true
 test-log.workspace = true
 mockall.workspace = true
 rstest.workspace = true
 mock_instant.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
