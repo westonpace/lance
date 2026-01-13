@@ -265,12 +265,16 @@ impl TakeStream {
 
         let _compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
         let schema = batches.first().expect_ok()?.schema();
-        let mut new_data = concat_batches(&schema, batches.iter())?;
+        let new_data = if batches.len() > 1 {
+            concat_batches(&schema, batches.iter())?
+        } else {
+            batches.into_iter().next().expect_ok()?
+        };
 
         // Restore previous order (if addresses were out of order originally)
-        if let Some(permutation) = permutation {
-            new_data = arrow_select::take::take_record_batch(&new_data, &permutation).unwrap();
-        }
+        // if let Some(permutation) = permutation {
+        //     new_data = arrow_select::take::take_record_batch(&new_data, &permutation).unwrap();
+        // }
 
         self.metrics
             .baseline_metrics

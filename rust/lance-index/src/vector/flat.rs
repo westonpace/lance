@@ -111,37 +111,34 @@ pub async fn compute_distance(
         vectors.nulls().cloned()
     };
 
-    tokio::task::spawn_blocking(move || {
-        // A selection vector may have been applied to _rowid column, so we need to
-        // push that onto vectors if possible.
+    // A selection vector may have been applied to _rowid column, so we need to
+    // push that onto vectors if possible.
 
-        let vectors = vectors
-            .into_data()
-            .into_builder()
-            .null_bit_buffer(validity_buffer.map(|b| b.buffer().clone()))
-            .build()
-            .map(make_array)?;
-        let distances = match vectors.data_type() {
-            DataType::FixedSizeList(_, _) => {
-                let vectors = vectors.as_fixed_size_list();
-                dt.arrow_batch_func()(key.as_ref(), vectors)? as ArrayRef
-            }
-            DataType::List(_) => {
-                let vectors = vectors.as_list();
-                let dists = multivec_distance(key.as_ref(), vectors, dt)?;
-                Arc::new(Float32Array::from(dists))
-            }
-            _ => {
-                unreachable!()
-            }
-        };
+    let vectors = vectors
+        .into_data()
+        .into_builder()
+        .null_bit_buffer(validity_buffer.map(|b| b.buffer().clone()))
+        .build()
+        .map(make_array)?;
+    let distances = match vectors.data_type() {
+        DataType::FixedSizeList(_, _) => {
+            let vectors = vectors.as_fixed_size_list();
+            dt.arrow_batch_func()(key.as_ref(), vectors)? as ArrayRef
+        }
+        DataType::List(_) => {
+            let vectors = vectors.as_list();
+            let dists = multivec_distance(key.as_ref(), vectors, dt)?;
+            Arc::new(Float32Array::from(dists))
+        }
+        _ => {
+            unreachable!()
+        }
+    };
 
-        batch
-            .try_with_column(distance_field(), distances)
-            .map_err(|e| Error::Execution {
-                message: format!("Failed to adding distance column: {}", e),
-                location: location!(),
-            })
-    })
-    .await?
+    batch
+        .try_with_column(distance_field(), distances)
+        .map_err(|e| Error::Execution {
+            message: format!("Failed to adding distance column: {}", e),
+            location: location!(),
+        })
 }
