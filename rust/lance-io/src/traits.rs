@@ -6,6 +6,7 @@ use std::ops::Range;
 use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
+use futures::future::BoxFuture;
 use object_store::path::Path;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -96,6 +97,13 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     ///
     /// TODO: change to read_at()?
     async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes>;
+
+    fn get_range_lite(
+        &self,
+        range: Range<usize>,
+    ) -> BoxFuture<'static, object_store::Result<Bytes>> {
+        panic!("get_range_lite is not implemented for this reader");
+    }
 
     /// Read all bytes from the object.
     ///

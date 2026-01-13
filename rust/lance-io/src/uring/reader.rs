@@ -14,6 +14,8 @@ use crate::utils::tracking_store::IOTracker;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
+use futures::future::BoxFuture;
+use futures::{FutureExt, TryFutureExt};
 use lance_core::{Error, Result};
 use object_store::path::Path;
 use snafu::location;
@@ -280,6 +282,24 @@ impl Reader for UringReader {
         }
 
         result
+    }
+
+    fn get_range_lite(
+        &self,
+        range: Range<usize>,
+    ) -> BoxFuture<'static, object_store::Result<Bytes>> {
+        let io_tracker = self.io_tracker.clone();
+        let path = self.handle.path.clone();
+        let num_bytes = range.len() as u64;
+        let range_u64 = (range.start as u64)..(range.end as u64);
+
+        let bytes_fut = self.submit_read(range.start as u64, range.len());
+        bytes_fut
+            .and_then(move |val| {
+                io_tracker.record_read("get_range", path, num_bytes, Some(range_u64));
+                std::future::ready(Ok(val))
+            })
+            .boxed()
     }
 
     /// Read the entire file using io_uring.

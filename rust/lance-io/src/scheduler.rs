@@ -45,7 +45,7 @@ static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
 //
 // Note: this only limits things that run through the scheduler.  It does not limit
 // IOPS from other sources like writing or commits.
-static DEFAULT_PROCESS_IOPS_LIMIT: i32 = 16 * 1024;
+static DEFAULT_PROCESS_IOPS_LIMIT: i32 = 128 * 16 * 1024;
 
 pub fn iops_counter() -> u64 {
     IOPS_COUNTER.load(Ordering::Acquire)
@@ -640,7 +640,7 @@ impl SchedulerConfig {
     pub fn max_bandwidth(store: &ObjectStore) -> Self {
         Self {
             io_buffer_size_bytes: 32 * 1024 * 1024 * store.io_parallelism() as u64,
-            use_lite_scheduler: false,
+            use_lite_scheduler: true,
         }
     }
 }
@@ -659,8 +659,8 @@ impl ScanScheduler {
                 io_capacity as u64,
                 config.io_buffer_size_bytes,
             )?);
-            let io_queue_clone = io_queue.clone();
-            tokio::task::spawn(async move { lite::babysitter_loop(io_queue_clone).await });
+            // let io_queue_clone = io_queue.clone();
+            // tokio::task::spawn(async move { lite::babysitter_loop(io_queue_clone).await });
             IoQueueType::Lite(io_queue)
         } else {
             let io_queue = Arc::new(IoQueue::new(
@@ -810,13 +810,10 @@ impl ScanScheduler {
                 let reader = reader.clone();
                 let queue = io_queue.clone();
                 let run_fn = Box::new(move || {
-                    async move {
-                        reader
-                            .get_range(task.start as usize..task.end as usize)
-                            .map_err(Error::from)
-                            .await
-                    }
-                    .boxed()
+                    reader
+                        .get_range_lite(task.start as usize..task.end as usize)
+                        .map_err(Error::from)
+                        .boxed()
                 });
                 queue.submit(task, priority, run_fn)
             })

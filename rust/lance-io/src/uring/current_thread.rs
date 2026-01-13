@@ -15,6 +15,8 @@ use crate::utils::tracking_store::IOTracker;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
+use futures::future::BoxFuture;
+use futures::{FutureExt, TryFutureExt};
 use io_uring::{opcode, types, IoUring};
 use lance_core::{Error, Result};
 use object_store::path::Path;
@@ -28,15 +30,12 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use tracing::instrument;
 
 // Re-use file handle types from reader.rs
 use super::reader::{CacheKey, CachedReaderData, UringFileHandle, HANDLE_CACHE};
 
 const DEFAULT_QUEUE_DEPTH: usize = 1024;
-const URING_TTL_SECS: u64 = 60;
-const DEFAULT_SUBMIT_THRESHOLD: usize = 16;
 
 /// Global counter for generating unique user_data values
 static USER_DATA_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -45,7 +44,6 @@ static USER_DATA_COUNTER: AtomicU64 = AtomicU64::new(1);
 struct ThreadLocalUring {
     ring: IoUring,
     pending: HashMap<u64, Arc<IoRequest>>,
-    last_accessed: Instant,
     pending_count: usize,
 }
 
@@ -53,36 +51,28 @@ thread_local! {
     static URING: RefCell<Option<ThreadLocalUring>> = RefCell::new(None);
 }
 
-/// Get or create the thread-local IoUring instance
-fn get_or_create_uring() -> io::Result<()> {
-    URING.with(|cell| {
-        let mut opt = cell.borrow_mut();
-
-        // Check if exists and not expired
-        if let Some(ref uring) = *opt {
-            let elapsed = uring.last_accessed.elapsed();
-            if elapsed < Duration::from_secs(URING_TTL_SECS) {
-                return Ok(());
-            }
-            // Expired - will be replaced below
-            log::debug!(
-                "Thread-local io_uring expired after {:?}, recreating",
-                elapsed
-            );
-        }
-
+/// Ensure the thread-local IoUring instance is initialized
+fn ensure_uring_initialized(
+    opt: &mut Option<ThreadLocalUring>,
+) -> io::Result<&mut ThreadLocalUring> {
+    // Check if exists
+    if opt.is_none() {
         // Create new IoUring
         let queue_depth = std::env::var("LANCE_URING_QUEUE_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_QUEUE_DEPTH);
 
-        let ring = IoUring::builder().build(queue_depth as u32).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to create io_uring: {}", e),
-            )
-        })?;
+        let ring = IoUring::builder()
+            .setup_defer_taskrun()
+            .setup_single_issuer()
+            .build(queue_depth as u32)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to create io_uring: {}", e),
+                )
+            })?;
 
         log::debug!(
             "Created thread-local io_uring with queue depth {}",
@@ -92,29 +82,19 @@ fn get_or_create_uring() -> io::Result<()> {
         *opt = Some(ThreadLocalUring {
             ring,
             pending: HashMap::new(),
-            last_accessed: Instant::now(),
             pending_count: 0,
         });
+    }
 
-        Ok(())
-    })
+    Ok(opt.as_mut().unwrap())
 }
 
 /// Push request to thread-local submission queue
 pub(super) fn push_request(request: Arc<IoRequest>) -> io::Result<()> {
-    get_or_create_uring()?;
-
     URING.with(|cell| {
         let mut opt = cell.borrow_mut();
-        let uring = opt.as_mut().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "Thread-local io_uring not initialized",
-            )
-        })?;
 
-        // Update access time
-        uring.last_accessed = Instant::now();
+        let uring = ensure_uring_initialized(&mut opt)?;
 
         // Generate unique user_data
         let user_data = USER_DATA_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -152,19 +132,7 @@ pub(super) fn push_request(request: Arc<IoRequest>) -> io::Result<()> {
         uring.pending.insert(user_data, request);
         uring.pending_count += 1;
 
-        // Submit if threshold reached
-        let threshold = std::env::var("LANCE_URING_CT_SUBMIT_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_SUBMIT_THRESHOLD);
-
-        if uring.pending_count >= threshold {
-            log::trace!(
-                "Auto-submitting {} requests (reached threshold)",
-                uring.pending_count
-            );
-            uring.ring.submit()?;
-        }
+        // Don't submit here - let the future handle submission
 
         Ok(())
     })
@@ -175,8 +143,6 @@ pub(super) fn process_thread_local_completions() -> io::Result<usize> {
     URING.with(|cell| {
         let mut opt = cell.borrow_mut();
         if let Some(ref mut uring) = *opt {
-            uring.last_accessed = Instant::now();
-
             let mut completed = 0;
 
             // Process all available completions
@@ -221,8 +187,8 @@ pub(super) fn submit_and_wait_thread_local() -> io::Result<()> {
     URING.with(|cell| {
         let mut opt = cell.borrow_mut();
         if let Some(ref mut uring) = *opt {
-            // Submit with wait=0 (non-blocking)
-            uring.ring.submit_and_wait(0)?;
+            // Submit with wait=1 (do at least some work)
+            uring.ring.submit_and_wait(1)?;
         }
         Ok(())
     })
@@ -390,6 +356,24 @@ impl Reader for UringCurrentThreadReader {
         }
 
         result
+    }
+
+    fn get_range_lite(
+        &self,
+        range: Range<usize>,
+    ) -> BoxFuture<'static, object_store::Result<Bytes>> {
+        let io_tracker = self.io_tracker.clone();
+        let path = self.handle.path.clone();
+        let num_bytes = range.len() as u64;
+        let range_u64 = (range.start as u64)..(range.end as u64);
+
+        let bytes_fut = self.submit_read(range.start as u64, range.len());
+        bytes_fut
+            .and_then(move |val| {
+                io_tracker.record_read("get_range", path, num_bytes, Some(range_u64));
+                std::future::ready(Ok(val))
+            })
+            .boxed()
     }
 
     /// Read the entire file using thread-local io_uring

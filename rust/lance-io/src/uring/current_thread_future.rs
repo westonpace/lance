@@ -29,20 +29,47 @@ impl Future for UringCurrentThreadFuture {
     type Output = object_store::Result<Bytes>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Process any available completions
-        if let Err(e) = process_thread_local_completions() {
-            log::warn!("Error processing completions: {:?}", e);
-        }
-
+        // Check thread safety
         if self.request.thread_id != std::thread::current().id() {
             panic!("Request thread ID does not match current thread ID");
+        }
+
+        // First, check if we've been completed by some other future polling for completions.
+        let mut state = self.request.state.lock().unwrap();
+
+        if state.completed {
+            // Take result and return Ready
+            match state.err.take() {
+                Some(err) => {
+                    return Poll::Ready(Err(object_store::Error::Generic {
+                        store: "io_uring_ct",
+                        source: Box::new(err),
+                    }));
+                }
+                None => {
+                    let bytes = std::mem::take(&mut state.buffer).freeze();
+                    return Poll::Ready(Ok(bytes));
+                }
+            }
+        }
+
+        drop(state);
+
+        // If not, then we should do any available work and the process completions.
+        if let Err(e) = submit_and_wait_thread_local() {
+            log::debug!("Submit and wait error: {:?}", e);
+        }
+
+        // Process completions
+        if let Err(e) = process_thread_local_completions() {
+            log::warn!("Error processing completions: {:?}", e);
         }
 
         // Check if our request completed
         let mut state = self.request.state.lock().unwrap();
 
         if state.completed {
-            // Take result
+            // Take result and return Ready
             match state.err.take() {
                 Some(err) => {
                     return Poll::Ready(Err(object_store::Error::Generic {
@@ -57,40 +84,9 @@ impl Future for UringCurrentThreadFuture {
             }
         }
 
-        // Not ready yet - submit and wait with timeout 0 (non-blocking)
+        // Not done yet - immediately wake and return Pending (don't store waker)
         drop(state);
-
-        if let Err(e) = submit_and_wait_thread_local() {
-            log::debug!("Submit and wait error: {:?}", e);
-        }
-
-        // Process completions again after submit_and_wait
-        if let Err(e) = process_thread_local_completions() {
-            log::warn!(
-                "Error processing completions after submit_and_wait: {:?}",
-                e
-            );
-        }
-
-        // Check again after processing
-        let mut state = self.request.state.lock().unwrap();
-        if state.completed {
-            match state.err.take() {
-                Some(err) => {
-                    return Poll::Ready(Err(object_store::Error::Generic {
-                        store: "io_uring_ct",
-                        source: Box::new(err),
-                    }));
-                }
-                None => {
-                    let bytes = std::mem::take(&mut state.buffer).freeze();
-                    return Poll::Ready(Ok(bytes));
-                }
-            }
-        }
-
-        // Still not ready - store waker and yield
-        state.waker = Some(cx.waker().clone());
+        cx.waker().wake_by_ref();
         Poll::Pending
     }
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashMap},
     fmt::Debug,
     future::Future,
     ops::Range,
@@ -34,7 +34,6 @@ enum TaskState {
     Running {
         backpressure_reservation: BackpressureReservation,
         inner: Pin<Box<dyn Future<Output = Result<Bytes>> + Send>>,
-        polled: bool,
     },
     Finished {
         backpressure_reservation: BackpressureReservation,
@@ -108,7 +107,6 @@ impl IoTask {
         self.state = TaskState::Running {
             backpressure_reservation,
             inner,
-            polled: false,
         };
         // If someone is already waiting for this task let them know it is now running
         // so they can poll it
@@ -124,7 +122,7 @@ impl IoTask {
         matches!(self.state, TaskState::Broken | TaskState::Finished { .. })
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>, is_babysitter: bool) -> Poll<bool> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
         match &mut self.state {
             TaskState::Broken => Poll::Ready(false),
             TaskState::Initial { idle_waker, .. } | TaskState::Reserved { idle_waker, .. } => {
@@ -133,33 +131,17 @@ impl IoTask {
             }
             TaskState::Running {
                 inner,
-                polled,
                 backpressure_reservation,
-            } => {
-                match (*polled, is_babysitter) {
-                    (true, true) => {
-                        // Decoder is already polling this task, so mark that we don't need to
-                        // babysit it any longer
-                        return Poll::Ready(false);
-                    }
-                    (_, false) => {
-                        // This is a decoder polling the task, so mark that decoder is interested
-                        *polled = true;
-                    }
-                    _ => {}
-                };
-
-                match inner.as_mut().poll(cx) {
-                    Poll::Ready(data) => {
-                        self.state = TaskState::Finished {
-                            data,
-                            backpressure_reservation: *backpressure_reservation,
-                        };
-                        Poll::Ready(true)
-                    }
-                    Poll::Pending => Poll::Pending,
+            } => match inner.as_mut().poll(cx) {
+                Poll::Ready(data) => {
+                    self.state = TaskState::Finished {
+                        data,
+                        backpressure_reservation: *backpressure_reservation,
+                    };
+                    Poll::Ready(true)
                 }
-            }
+                Poll::Pending => Poll::Pending,
+            },
             TaskState::Finished { .. } => Poll::Ready(false),
         }
     }
@@ -219,6 +201,12 @@ impl ConcurrencyThrottle for SimpleConcurrencyThrottle {
             }
             *process_concurrency_limit -= 1;
             self.concurrency_available -= 1;
+            if self.concurrency_available < 5 || *process_concurrency_limit < 5 {
+                println!(
+                    "acquire: concurrency now {} (process limit {})",
+                    self.concurrency_available, *process_concurrency_limit
+                );
+            }
             true
         } else {
             false
@@ -229,6 +217,12 @@ impl ConcurrencyThrottle for SimpleConcurrencyThrottle {
         let mut process_concurrency_limit = PROCESS_CONCURRENCY_LIMIT.lock().unwrap();
         *process_concurrency_limit += 1;
         self.concurrency_available += 1;
+        if self.concurrency_available < 5 || *process_concurrency_limit < 5 {
+            println!(
+                "release: concurrency now {} (process limit {})",
+                self.concurrency_available, *process_concurrency_limit
+            );
+        }
     }
 }
 
@@ -383,8 +377,6 @@ struct IoQueueState {
     backpressure_throttle: Box<dyn BackpressureThrottle>,
     pending_tasks: BinaryHeap<TaskEntry>,
     tasks: HashMap<u64, IoTask>,
-    tasks_to_babysit: HashSet<u64>,
-    wake_babysitter: Option<Waker>,
     next_task_id: u64,
 }
 
@@ -398,8 +390,6 @@ impl IoQueueState {
             )?),
             pending_tasks: BinaryHeap::new(),
             tasks: HashMap::new(),
-            tasks_to_babysit: HashSet::new(),
-            wake_babysitter: None,
             next_task_id: 0,
         })
     }
@@ -459,27 +449,17 @@ impl IoQueue {
         {
             task.reserve(reservation)?;
             if state.concurrency_throttle.try_acquire() {
-                task.start()?;
-                // If the underlying I/O is synchronous (e.g. in-memory I/O) then it will
-                // already be finished at this point
-                //
-                // Otherwise, we need to add it to the list of tasks to babysit and wake the babysitter
+                if let Err(e) = task.start() {
+                    // Release the concurrency throttle on error
+                    state.concurrency_throttle.release();
+                    return Err(e);
+                }
+                // This can be true if the task broke on start (though in theory that should be impossible)
                 let finished = task.is_finished();
-                log::trace!(
-                    "Started I/O task with id {} and finished={}",
-                    task_id,
-                    finished
-                );
+                log::trace!("Started I/O task with id {}", task_id,);
                 state.tasks.insert(task_id, task);
                 if finished {
                     state.concurrency_throttle.release();
-                } else {
-                    state.tasks_to_babysit.insert(task_id);
-                    let waker = state.wake_babysitter.take();
-                    drop(state);
-                    if let Some(waker) = waker {
-                        waker.wake();
-                    }
                 }
                 return Ok(());
             }
@@ -526,7 +506,6 @@ impl IoQueue {
     }
 
     fn on_task_complete(&self, mut state: MutexGuard<IoQueueState>) -> Result<()> {
-        let mut has_new_babysitting_task = false;
         let state_ref = &mut *state;
         while !state_ref.pending_tasks.is_empty() {
             // Unwrap safe here since we just checked the queue is not empty
@@ -548,23 +527,16 @@ impl IoQueue {
                 break;
             };
             state_ref.pending_tasks.pop();
-            task.start()?;
+            if let Err(e) = task.start() {
+                // Release the concurrency throttle on error
+                state_ref.concurrency_throttle.release();
+                return Err(e);
+            }
             if task.is_finished() {
                 state_ref.concurrency_throttle.release();
-            } else {
-                state_ref.tasks_to_babysit.insert(task.id);
-                has_new_babysitting_task = true;
             }
         }
 
-        // If we started any tasks then wake the babysitter to start babysitting them
-        if has_new_babysitting_task {
-            let waker = state.wake_babysitter.take();
-            drop(state);
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }
         Ok(())
     }
 
@@ -577,16 +549,13 @@ impl IoQueue {
                 location: location!(),
             }));
         };
-        match task.poll(cx, false) {
+        match task.poll(cx) {
             Poll::Ready(newly_finished) => {
                 if newly_finished {
                     // Only release the concurrency throttle if we just finished the task
                     state.concurrency_throttle.release();
                 }
                 let task = state.tasks.remove(&task_id).unwrap();
-                // This may be a no-op if the task was finished by babysitter but leaving it in
-                // for completeness
-                state.tasks_to_babysit.remove(&task_id);
                 let (bytes, reservation) = task.consume()?;
                 state.backpressure_throttle.release(reservation);
                 // We run on_task_complete even if not newly finished because we released the backpressure reservation
@@ -599,36 +568,6 @@ impl IoQueue {
         }
     }
 
-    fn babysit(&self, cx: &mut Context<'_>) {
-        let mut state = self.state.lock().unwrap();
-        let mut tasks_to_babysit = std::mem::take(&mut state.tasks_to_babysit);
-        let mut finished_tasks = false;
-        tasks_to_babysit.retain(|task_id| {
-            let Some(task) = state.tasks.get_mut(task_id) else {
-                log::warn!("Task with id {} was lost", task_id);
-                return false;
-            };
-            match task.poll(cx, true) {
-                Poll::Ready(true) => {
-                    finished_tasks = true;
-                    state.concurrency_throttle.release();
-                    false
-                }
-                Poll::Ready(false) => false,
-                Poll::Pending => true,
-            }
-        });
-        state.tasks_to_babysit = tasks_to_babysit;
-        state.wake_babysitter.replace(cx.waker().clone());
-        if finished_tasks {
-            // Even though we haven't released pressure on the backpressure throttle we have
-            // released the concurrency throttle and so more tasks might be able to start
-            if let Err(e) = self.on_task_complete(state) {
-                log::warn!("Error completing I/O tasks in babysitter: {:?}", e);
-            }
-        }
-    }
-
     pub(super) fn close(&self) {
         let mut state = self.state.lock().unwrap();
         for task in std::mem::take(&mut state.tasks).values_mut() {
@@ -636,27 +575,6 @@ impl IoQueue {
                 state.concurrency_throttle.release();
             }
         }
-    }
-}
-
-struct BabysitFuture<'a> {
-    queue: &'a IoQueue,
-}
-
-impl<'a> Future for BabysitFuture<'a> {
-    type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.queue.babysit(cx);
-        Poll::Pending
-    }
-}
-
-pub(super) async fn babysitter_loop(queue: Arc<IoQueue>) {
-    loop {
-        BabysitFuture {
-            queue: queue.as_ref(),
-        }
-        .await;
     }
 }
 
