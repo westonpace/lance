@@ -201,12 +201,6 @@ impl ConcurrencyThrottle for SimpleConcurrencyThrottle {
             }
             *process_concurrency_limit -= 1;
             self.concurrency_available -= 1;
-            if self.concurrency_available < 5 || *process_concurrency_limit < 5 {
-                println!(
-                    "acquire: concurrency now {} (process limit {})",
-                    self.concurrency_available, *process_concurrency_limit
-                );
-            }
             true
         } else {
             false
@@ -217,12 +211,6 @@ impl ConcurrencyThrottle for SimpleConcurrencyThrottle {
         let mut process_concurrency_limit = PROCESS_CONCURRENCY_LIMIT.lock().unwrap();
         *process_concurrency_limit += 1;
         self.concurrency_available += 1;
-        if self.concurrency_available < 5 || *process_concurrency_limit < 5 {
-            println!(
-                "release: concurrency now {} (process limit {})",
-                self.concurrency_available, *process_concurrency_limit
-            );
-        }
     }
 }
 
