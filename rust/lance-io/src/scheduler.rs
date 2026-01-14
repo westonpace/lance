@@ -640,7 +640,7 @@ impl SchedulerConfig {
     pub fn max_bandwidth(store: &ObjectStore) -> Self {
         Self {
             io_buffer_size_bytes: 32 * 1024 * 1024 * store.io_parallelism() as u64,
-            use_lite_scheduler: true,
+            use_lite_scheduler: std::env::var("LANCE_USE_LITE_SCHEDULER").is_ok(),
         }
     }
 }
