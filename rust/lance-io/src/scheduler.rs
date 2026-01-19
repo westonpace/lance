@@ -31,6 +31,16 @@ const BACKPRESSURE_DEBOUNCE: u64 = 60;
 static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Global counter of how many bytes were read by the scheduler
 static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Global counter of how many bytes are currently reserved across all schedulers
+static BYTES_RESERVED_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Last time we emitted a tracing event for IOPS quota (in milliseconds since process start)
+static IOPS_QUOTA_LAST_EMIT_MS: AtomicU64 = AtomicU64::new(0);
+// Last time we emitted a tracing event for bytes reserved (in milliseconds since process start)
+static BYTES_RESERVED_LAST_EMIT_MS: AtomicU64 = AtomicU64::new(0);
+// Process start time for computing elapsed milliseconds
+static PROCESS_START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+// Minimum interval between tracing events (100ms)
+const TRACING_EMIT_INTERVAL_MS: u64 = 100;
 // By default, we limit the number of IOPS across the entire process to 128
 //
 // In theory this is enough for ~10GBps on S3 following the guidelines to issue
@@ -51,6 +61,25 @@ pub fn iops_counter() -> u64 {
 
 pub fn bytes_read_counter() -> u64 {
     BYTES_READ_COUNTER.load(Ordering::Acquire)
+}
+
+pub fn bytes_reserved_counter() -> u64 {
+    BYTES_RESERVED_COUNTER.load(Ordering::Acquire)
+}
+
+/// Check if enough time has passed since the last emit and update the timestamp if so.
+/// Returns true if a tracing event should be emitted.
+fn should_emit_tracing(last_emit: &AtomicU64) -> bool {
+    let now_ms = PROCESS_START.elapsed().as_millis() as u64;
+    let last = last_emit.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) >= TRACING_EMIT_INTERVAL_MS {
+        // Use compare_exchange to avoid duplicate emissions
+        last_emit
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    } else {
+        false
+    }
 }
 
 // There are two structures that control the I/O scheduler concurrency.  First,
@@ -133,6 +162,10 @@ impl IopsQuota {
     // Acquire a reservation on the global IOPS quota
     async fn acquire(&self) -> IopsReservation<'_> {
         if let Some(iops_avail) = self.iops_avail.as_ref() {
+            if should_emit_tracing(&IOPS_QUOTA_LAST_EMIT_MS) {
+                let available = iops_avail.available_permits();
+                tracing::info!(iops_available = available, "avail_process_iops");
+            }
             IopsReservation {
                 value: Some(iops_avail.acquire().await.unwrap()),
             }
@@ -249,7 +282,15 @@ impl IoQueueState {
         if self.can_deliver(task) {
             self.priorities_in_flight.push(task.priority);
             self.iops_avail -= 1;
-            self.bytes_avail -= task.num_bytes() as i64;
+            let bytes_to_reserve = task.num_bytes();
+            self.bytes_avail -= bytes_to_reserve as i64;
+            // Track global bytes reserved
+            let global_reserved = BYTES_RESERVED_COUNTER
+                .fetch_add(bytes_to_reserve, Ordering::Relaxed)
+                + bytes_to_reserve;
+            if should_emit_tracing(&BYTES_RESERVED_LAST_EMIT_MS) {
+                tracing::info!(bytes_reserved = global_reserved, "bytes_reserved");
+            }
             if self.bytes_avail < 0 {
                 // This can happen when we admit special priority requests
                 log::debug!(
@@ -334,6 +375,8 @@ impl IoQueue {
     fn on_bytes_consumed(&self, bytes: u64, priority: u128, num_reqs: usize) {
         let mut state = self.state.lock().unwrap();
         state.bytes_avail += bytes as i64;
+        // Release bytes from global reservation
+        BYTES_RESERVED_COUNTER.fetch_sub(bytes, Ordering::Relaxed);
         for _ in 0..num_reqs {
             state.priorities_in_flight.remove(priority);
         }
