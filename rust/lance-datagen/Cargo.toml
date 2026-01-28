@@ -9,6 +9,10 @@ readme = { workspace = true }
 keywords = { workspace = true }
 categories = { workspace = true }
 
+[features]
+default = []
+yaml = ["dep:serde", "dep:serde_yaml"]
+
 [dependencies]
 arrow = { workspace = true }
 arrow-array = { workspace = true }
@@ -22,6 +26,8 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 rand_xoshiro = { workspace = true }
 random_word = { version = "0.5", features = ["en"] }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_yaml = { version = "0.9", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
