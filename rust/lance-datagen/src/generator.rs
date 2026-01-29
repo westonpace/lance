@@ -114,6 +114,19 @@ pub trait ArrayGenerator: Send + Sync + std::fmt::Debug {
     fn element_size_bytes(&self) -> Option<ByteCount>;
 }
 
+/// A configured data generator that can produce record batches.
+///
+/// This is the core abstraction for data generation. Implementations might
+/// generate random columnar data (via [`BatchGeneratorBuilder`]), TPC-H data,
+/// samples from existing datasets, etc.
+pub trait DataGenerator: Send + Sync {
+    /// The schema of the data this generator produces.
+    fn schema(&self) -> SchemaRef;
+
+    /// Generate a single batch with the given number of rows.
+    fn generate(&mut self, num_rows: RowCount) -> Result<RecordBatch, ArrowError>;
+}
+
 #[derive(Debug)]
 pub struct CycleNullGenerator {
     generator: Box<dyn ArrayGenerator>,
@@ -2000,20 +2013,19 @@ impl ArrayGenerator for RandomStructGenerator {
     }
 }
 
-/// A RecordBatchReader that generates batches of the given size from the given array generators
-pub struct FixedSizeBatchGenerator {
+/// A [`DataGenerator`] built from individual column [`ArrayGenerator`]s.
+struct FixedSizeBatchGenerator {
     rng: rand_xoshiro::Xoshiro256PlusPlus,
     generators: Vec<Box<dyn ArrayGenerator>>,
-    batch_size: RowCount,
-    num_batches: BatchCount,
     schema: SchemaRef,
 }
 
 impl FixedSizeBatchGenerator {
-    fn new(
+    /// Create a generator from named column generators.
+    ///
+    /// Builds the schema, applies null wrapping, and initialises the RNG.
+    fn from_generators(
         generators: Vec<(Option<String>, Box<dyn ArrayGenerator>)>,
-        batch_size: RowCount,
-        num_batches: BatchCount,
         seed: Option<Seed>,
         default_null_probability: Option<f64>,
     ) -> Self {
@@ -2044,42 +2056,146 @@ impl FixedSizeBatchGenerator {
                 seed.map(|s| s.0).unwrap_or(DEFAULT_SEED.0),
             ),
             generators,
-            batch_size,
-            num_batches,
             schema,
         }
     }
+}
 
-    fn gen_next(&mut self) -> Result<RecordBatch, ArrowError> {
+impl DataGenerator for FixedSizeBatchGenerator {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn generate(&mut self, num_rows: RowCount) -> Result<RecordBatch, ArrowError> {
         let mut arrays = Vec::with_capacity(self.generators.len());
         for genn in self.generators.iter_mut() {
-            let arr = genn.generate(self.batch_size, &mut self.rng)?;
+            let arr = genn.generate(num_rows, &mut self.rng)?;
             arrays.push(arr);
         }
-        self.num_batches.0 -= 1;
-        Ok(RecordBatch::try_new_with_options(
+        RecordBatch::try_new_with_options(
             self.schema.clone(),
             arrays,
-            &RecordBatchOptions::new().with_row_count(Some(self.batch_size.0 as usize)),
+            &RecordBatchOptions::new().with_row_count(Some(num_rows.0 as usize)),
         )
-        .unwrap())
     }
 }
 
-impl Iterator for FixedSizeBatchGenerator {
+/// A [`RecordBatchReader`] adapter for any [`DataGenerator`].
+///
+/// Wraps a boxed `DataGenerator` and produces a fixed number of batches, each
+/// with the configured row count.
+pub struct DataGeneratorReader {
+    gen: Box<dyn DataGenerator>,
+    batch_size: RowCount,
+    remaining: BatchCount,
+    schema: SchemaRef,
+}
+
+impl DataGeneratorReader {
+    /// Create a new reader that will produce `num_batches` batches of
+    /// `batch_size` rows from the given generator.
+    pub fn new(gen: Box<dyn DataGenerator>, batch_size: RowCount, num_batches: BatchCount) -> Self {
+        let schema = gen.schema();
+        Self {
+            gen,
+            batch_size,
+            remaining: num_batches,
+            schema,
+        }
+    }
+}
+
+impl Iterator for DataGeneratorReader {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.num_batches.0 == 0 {
+        if self.remaining.0 == 0 {
             return None;
         }
-        Some(self.gen_next())
+        self.remaining.0 -= 1;
+        Some(self.gen.generate(self.batch_size))
     }
 }
 
-impl RecordBatchReader for FixedSizeBatchGenerator {
+impl RecordBatchReader for DataGeneratorReader {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+}
+
+/// Wrapper that lets an [`Arc`]-owned [`DataGenerator`] be boxed as
+/// `Box<dyn DataGenerator>`.
+///
+/// Requires sole ownership of the `Arc` (no other strong or weak references).
+/// If other references exist, [`generate`](DataGenerator::generate) returns an
+/// error.
+struct ArcDataGenerator(Arc<dyn DataGenerator>);
+
+impl DataGenerator for ArcDataGenerator {
+    fn schema(&self) -> SchemaRef {
+        self.0.schema()
+    }
+
+    fn generate(&mut self, num_rows: RowCount) -> Result<RecordBatch, ArrowError> {
+        Arc::get_mut(&mut self.0)
+            .ok_or_else(|| {
+                ArrowError::InvalidArgumentError(
+                    "cannot generate: other Arc references to this DataGenerator exist".to_string(),
+                )
+            })?
+            .generate(num_rows)
+    }
+}
+
+/// Extension trait providing convenience methods for producing record batches
+/// from any type that can be converted into a [`DataGenerator`].
+///
+/// Implemented for [`Box<dyn DataGenerator>`], [`Arc<dyn DataGenerator>`],
+/// and [`BatchGeneratorBuilder`].
+pub trait DatagenExt: Sized {
+    /// Convert into a boxed [`DataGenerator`].
+    fn into_generator(self) -> Box<dyn DataGenerator>;
+
+    /// Generate a single batch with the given number of rows.
+    fn into_batch_rows(self, batch_size: RowCount) -> Result<RecordBatch, ArrowError> {
+        self.into_generator().generate(batch_size)
+    }
+
+    /// Create a [`RecordBatchReader`] that generates batches of the given size
+    /// (in rows).
+    fn into_reader_rows(
+        self,
+        batch_size: RowCount,
+        num_batches: BatchCount,
+    ) -> DataGeneratorReader {
+        DataGeneratorReader::new(self.into_generator(), batch_size, num_batches)
+    }
+
+    /// Create a stream of generated record batches.
+    fn into_reader_stream(
+        self,
+        batch_size: RowCount,
+        num_batches: BatchCount,
+    ) -> (
+        BoxStream<'static, Result<RecordBatch, ArrowError>>,
+        Arc<Schema>,
+    ) {
+        let reader = self.into_reader_rows(batch_size, num_batches);
+        let schema = reader.schema();
+        let batches = reader.collect::<Vec<_>>();
+        (futures::stream::iter(batches).boxed(), schema)
+    }
+}
+
+impl DatagenExt for Box<dyn DataGenerator> {
+    fn into_generator(self) -> Box<dyn DataGenerator> {
+        self
+    }
+}
+
+impl DatagenExt for Arc<dyn DataGenerator> {
+    fn into_generator(self) -> Box<dyn DataGenerator> {
+        Box::new(ArcDataGenerator(self))
     }
 }
 
@@ -2130,13 +2246,6 @@ impl BatchGeneratorBuilder {
         self
     }
 
-    pub fn into_batch_rows(self, batch_size: RowCount) -> Result<RecordBatch, ArrowError> {
-        let mut reader = self.into_reader_rows(batch_size, BatchCount::from(1));
-        reader
-            .next()
-            .expect("Asked for 1 batch but reader was empty")
-    }
-
     pub fn into_batch_bytes(
         self,
         batch_size: ByteCount,
@@ -2146,36 +2255,6 @@ impl BatchGeneratorBuilder {
         reader
             .next()
             .expect("Asked for 1 batch but reader was empty")
-    }
-
-    /// Create a RecordBatchReader that generates batches of the given size (in rows)
-    pub fn into_reader_rows(
-        self,
-        batch_size: RowCount,
-        num_batches: BatchCount,
-    ) -> impl RecordBatchReader {
-        FixedSizeBatchGenerator::new(
-            self.generators,
-            batch_size,
-            num_batches,
-            self.seed,
-            self.default_null_probability,
-        )
-    }
-
-    pub fn into_reader_stream(
-        self,
-        batch_size: RowCount,
-        num_batches: BatchCount,
-    ) -> (
-        BoxStream<'static, Result<RecordBatch, ArrowError>>,
-        Arc<Schema>,
-    ) {
-        // TODO: this is pretty lazy and could be optimized
-        let reader = self.into_reader_rows(batch_size, num_batches);
-        let schema = reader.schema();
-        let batches = reader.collect::<Vec<_>>();
-        (futures::stream::iter(batches).boxed(), schema)
     }
 
     /// Create a RecordBatchReader that generates batches of the given size (in bytes)
@@ -2219,6 +2298,53 @@ impl BatchGeneratorBuilder {
     /// Adds nulls (with the given probability) to all columns
     pub fn with_random_nulls(&mut self, default_null_probability: f64) {
         self.default_null_probability = Some(default_null_probability);
+    }
+
+    // Backwards-compatible proxies for [`DatagenExt`] methods so that callers
+    // do not need to import the trait.
+
+    /// Generate a single batch with the given number of rows.
+    pub fn into_batch_rows(self, batch_size: RowCount) -> Result<RecordBatch, ArrowError> {
+        DatagenExt::into_batch_rows(self, batch_size)
+    }
+
+    /// Create a [`RecordBatchReader`] that generates batches of the given size (in rows).
+    pub fn into_reader_rows(
+        self,
+        batch_size: RowCount,
+        num_batches: BatchCount,
+    ) -> DataGeneratorReader {
+        DatagenExt::into_reader_rows(self, batch_size, num_batches)
+    }
+
+    /// Create a stream of generated record batches.
+    pub fn into_reader_stream(
+        self,
+        batch_size: RowCount,
+        num_batches: BatchCount,
+    ) -> (
+        BoxStream<'static, Result<RecordBatch, ArrowError>>,
+        Arc<Schema>,
+    ) {
+        DatagenExt::into_reader_stream(self, batch_size, num_batches)
+    }
+
+    /// Build a [`DataGenerator`] from the configured columns.
+    ///
+    /// The returned generator can produce record batches of any row count
+    /// via [`DataGenerator::generate`].
+    pub fn build(self) -> Box<dyn DataGenerator> {
+        Box::new(FixedSizeBatchGenerator::from_generators(
+            self.generators,
+            self.seed,
+            self.default_null_probability,
+        ))
+    }
+}
+
+impl DatagenExt for BatchGeneratorBuilder {
+    fn into_generator(self) -> Box<dyn DataGenerator> {
+        self.build()
     }
 }
 

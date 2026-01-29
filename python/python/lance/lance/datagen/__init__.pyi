@@ -22,3 +22,13 @@ def rand_batches(
     batch_size_bytes: Optional[int] = None,
 ): ...
 def is_datagen_supported() -> bool: ...
+def from_yaml(
+    yaml: str,
+    num_rows: int,
+    num_batches: int,
+) -> pa.RecordBatchReader: ...
+def from_yaml_file(
+    path: str,
+    num_rows: int,
+    num_batches: int,
+) -> pa.RecordBatchReader: ...

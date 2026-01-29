@@ -4065,6 +4065,8 @@ dependencies = [
  "rand_distr 0.5.1",
  "rand_xoshiro",
  "random_word",
+ "serde",
+ "serde_yaml",
 ]
 
 [[package]]

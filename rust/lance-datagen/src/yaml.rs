@@ -34,7 +34,9 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Fields, IntervalUnit, TimeUnit};
 use serde::Deserialize;
 
-use crate::generator::{array, ArrayGenerator, ArrayGeneratorExt, BatchGeneratorBuilder, Seed};
+use crate::generator::{
+    array, ArrayGenerator, ArrayGeneratorExt, BatchGeneratorBuilder, DataGenerator, Seed,
+};
 
 /// Error type for YAML parsing and configuration validation
 #[derive(Debug)]
@@ -346,6 +348,54 @@ pub fn from_yaml(yaml: &str) -> Result<BatchGeneratorBuilder, YamlError> {
 pub fn from_yaml_file(path: &Path) -> Result<BatchGeneratorBuilder, YamlError> {
     let config = parse_yaml_file(path)?;
     config_to_builder(config)
+}
+
+/// Parse a YAML string and return a [`DataGenerator`].
+///
+/// The YAML may contain a top-level `type` field that selects the generator
+/// backend. Currently only `"random"` (the default) is supported, which
+/// delegates to [`config_to_builder`] + [`BatchGeneratorBuilder::build`].
+///
+/// # Example
+///
+/// ```
+/// # use lance_datagen::yaml::generator_from_yaml;
+/// # use lance_datagen::RowCount;
+/// let yaml = r#"
+/// seed: 42
+/// columns:
+///   - name: id
+///     generator: step
+///     type: int64
+/// "#;
+/// let mut gen = generator_from_yaml(yaml).unwrap();
+/// let batch = gen.generate(RowCount::from(10)).unwrap();
+/// assert_eq!(batch.num_rows(), 10);
+/// ```
+pub fn generator_from_yaml(yaml: &str) -> Result<Box<dyn DataGenerator>, YamlError> {
+    let value: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+    let generator_type = value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("random");
+    match generator_type {
+        "random" => {
+            let config: DatagenConfig = serde_yaml::from_value(value)?;
+            Ok(config_to_builder(config)?.build())
+        }
+        other => Err(YamlError::InvalidGenerator(format!(
+            "Unknown generator type: {}",
+            other
+        ))),
+    }
+}
+
+/// Parse a YAML file and return a [`DataGenerator`].
+///
+/// See [`generator_from_yaml`] for details on the expected format.
+pub fn generator_from_yaml_file(path: &Path) -> Result<Box<dyn DataGenerator>, YamlError> {
+    let content = std::fs::read_to_string(path)?;
+    generator_from_yaml(&content)
 }
 
 /// Parse a data type string into an Arrow DataType
