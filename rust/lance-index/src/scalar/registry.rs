@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{cache::LanceCache, Result};
 
+use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::{
     frag_reuse::FragReuseIndex,
@@ -115,6 +116,28 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex>;
+
+    /// Train a new index with progress callbacks.
+    ///
+    /// Plugins can override this for index-specific stages. The default implementation
+    /// wraps [`Self::train_index`] with a generic scalar training stage.
+    async fn train_index_with_progress(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        progress.stage_start("train_scalar", None, "").await?;
+        let result = self
+            .train_index(data, index_store, request, fragment_ids)
+            .await;
+        if result.is_ok() {
+            progress.stage_complete("train_scalar").await?;
+        }
+        result
+    }
 
     /// A short name for the index
     ///
