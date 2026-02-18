@@ -28,7 +28,7 @@ use lance_core::Error;
 use snafu::location;
 
 use crate::pbold;
-use crate::progress::{noop_progress, IndexBuildProgress};
+use crate::progress::IndexBuildProgress;
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
@@ -171,29 +171,6 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     ///
     /// It is the caller's responsibility to store these details somewhere.
     async fn train_index(
-        &self,
-        data: SendableRecordBatchStream,
-        index_store: &dyn IndexStore,
-        request: Box<dyn TrainingRequest>,
-        fragment_ids: Option<Vec<u32>>,
-    ) -> Result<CreatedIndex> {
-        let request = (request as Box<dyn std::any::Any>)
-            .downcast::<InvertedIndexTrainingRequest>()
-            .map_err(|_| Error::InvalidInput {
-                source: "must provide training request created by new_training_request".into(),
-                location: location!(),
-            })?;
-        Self::train_inverted_index(
-            data,
-            index_store,
-            request.parameters.clone(),
-            fragment_ids,
-            noop_progress(),
-        )
-        .await
-    }
-
-    async fn train_index_with_progress(
         &self,
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,

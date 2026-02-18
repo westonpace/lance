@@ -414,6 +414,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
             return Err(Error::InvalidInput {
@@ -450,7 +451,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         let data = unnest_chunks(data)?;
         let bitmap_plugin = BitmapIndexPlugin;
         bitmap_plugin
-            .train_index(data, index_store, request, fragment_ids)
+            .train_index(data, index_store, request, fragment_ids, progress)
             .await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())

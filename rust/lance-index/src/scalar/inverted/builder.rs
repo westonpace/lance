@@ -215,25 +215,29 @@ impl InvertedIndexBuilder {
         }));
         log::info!("indexing FTS with {} workers", num_workers);
 
-        let mut last_num_rows = 0;
+        let mut last_progress_num_rows = 0;
+        let mut last_log_num_rows = 0;
         let mut total_num_rows = 0;
         let start = std::time::Instant::now();
         while let Some(num_rows) = stream.try_next().await? {
             total_num_rows += num_rows;
-            if total_num_rows >= last_num_rows + 1_000_000 {
+            if total_num_rows >= last_progress_num_rows + 10_000 {
                 self.progress
                     .stage_progress("tokenize_docs", total_num_rows as u64)
                     .await?;
+                last_progress_num_rows = total_num_rows;
+            }
+            if total_num_rows >= last_log_num_rows + 1_000_000 {
                 log::debug!(
                     "indexed {} documents, elapsed: {:?}, speed: {}rows/s",
                     total_num_rows,
                     start.elapsed(),
                     total_num_rows as f32 / start.elapsed().as_secs_f32()
                 );
-                last_num_rows = total_num_rows;
+                last_log_num_rows = total_num_rows;
             }
         }
-        if total_num_rows > last_num_rows {
+        if total_num_rows > last_progress_num_rows {
             self.progress
                 .stage_progress("tokenize_docs", total_num_rows as u64)
                 .await?;

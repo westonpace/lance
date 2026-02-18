@@ -293,7 +293,7 @@ pub(super) async fn build_scalar_index(
     progress.stage_complete("load_data").await?;
 
     plugin
-        .train_index_with_progress(
+        .train_index(
             training_data,
             &index_store,
             training_request,

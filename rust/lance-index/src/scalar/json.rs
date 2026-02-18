@@ -776,6 +776,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<JsonTrainingRequest>()
@@ -805,7 +806,13 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         )?;
 
         let target_index = target_plugin
-            .train_index(converted_stream, index_store, target_request, fragment_ids)
+            .train_index(
+                converted_stream,
+                index_store,
+                target_request,
+                fragment_ids,
+                progress,
+            )
             .await?;
 
         let index_details = crate::pb::JsonIndexDetails {

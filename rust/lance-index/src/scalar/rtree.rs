@@ -882,6 +882,7 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         if fragment_ids.is_some() {
             return Err(Error::InvalidInput {
@@ -1021,6 +1022,7 @@ mod tests {
                     page_size: Some(page_size),
                 })),
                 None,
+                crate::progress::noop_progress(),
             )
             .await
             .unwrap();
