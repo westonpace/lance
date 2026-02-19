@@ -171,15 +171,18 @@ impl InvertedIndexBuilder {
         let with_position = self.params.with_position;
         let next_id = self.partitions.iter().map(|id| id + 1).max().unwrap_or(0);
         let id_alloc = Arc::new(AtomicU64::new(next_id));
+        let tokenized_count = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = async_channel::bounded(num_workers);
         let mut index_tasks = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
             let store = self.local_store.clone();
             let tokenizer = tokenizer.clone();
-            let receiver = receiver.clone();
+            let receiver: async_channel::Receiver<RecordBatch> = receiver.clone();
             let id_alloc = id_alloc.clone();
+            let progress = self.progress.clone();
             let fragment_mask = self.fragment_mask;
             let token_set_format = self.token_set_format;
+            let tokenized_count = tokenized_count.clone();
             let task = tokio::task::spawn(async move {
                 let mut worker = IndexWorker::new(
                     store,
@@ -191,7 +194,14 @@ impl InvertedIndexBuilder {
                 )
                 .await?;
                 while let Ok(batch) = receiver.recv().await {
+                    let num_rows = batch.num_rows();
                     worker.process_batch(batch).await?;
+                    let tokenized_count = tokenized_count
+                        .fetch_add(num_rows as u64, std::sync::atomic::Ordering::Relaxed)
+                        + num_rows as u64;
+                    progress
+                        .stage_progress("tokenize_docs", tokenized_count as u64)
+                        .await?;
                 }
                 let partitions = worker.finish().await?;
                 Result::Ok(partitions)
@@ -222,9 +232,6 @@ impl InvertedIndexBuilder {
         while let Some(num_rows) = stream.try_next().await? {
             total_num_rows += num_rows;
             if total_num_rows >= last_progress_num_rows + 10_000 {
-                self.progress
-                    .stage_progress("tokenize_docs", total_num_rows as u64)
-                    .await?;
                 last_progress_num_rows = total_num_rows;
             }
             if total_num_rows >= last_log_num_rows + 1_000_000 {
@@ -236,11 +243,6 @@ impl InvertedIndexBuilder {
                 );
                 last_log_num_rows = total_num_rows;
             }
-        }
-        if total_num_rows > last_progress_num_rows {
-            self.progress
-                .stage_progress("tokenize_docs", total_num_rows as u64)
-                .await?;
         }
         // drop the sender to stop receivers
         drop(stream);
