@@ -177,6 +177,7 @@ over environment variables:
 
 | Setting            | Storage Option Key              | Env Var                         | Default |
 | ------------------ | ------------------------------- | ------------------------------- | ------- |
+| Enabled            | `lance_aimd_enabled`            | `LANCE_AIMD_ENABLED`            | true    |
 | Initial rate       | `lance_aimd_initial_rate`       | `LANCE_AIMD_INITIAL_RATE`       | 2000    |
 | Min rate           | `lance_aimd_min_rate`           | `LANCE_AIMD_MIN_RATE`           | 1       |
 | Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 5000    |

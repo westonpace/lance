@@ -160,9 +160,13 @@ impl ObjectStoreProvider for AwsStoreProvider {
             self.build_amazon_s3_store(&mut base_path, params, &storage_options, is_s3_express)
                 .await?
         };
-        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
-        let inner =
-            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>;
+        let inner = if let Some(throttle_config) =
+            AimdThrottleConfig::from_storage_options(params.storage_options())?
+        {
+            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>
+        } else {
+            inner
+        };
 
         Ok(ObjectStore {
             inner,

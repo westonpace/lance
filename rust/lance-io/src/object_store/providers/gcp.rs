@@ -109,9 +109,13 @@ impl ObjectStoreProvider for GcsStoreProvider {
             self.build_google_cloud_store(&base_path, &storage_options)
                 .await?
         };
-        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
-        let inner =
-            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>;
+        let inner = if let Some(throttle_config) =
+            AimdThrottleConfig::from_storage_options(params.storage_options())?
+        {
+            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>
+        } else {
+            inner
+        };
 
         Ok(ObjectStore {
             inner,

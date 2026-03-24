@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -144,12 +145,16 @@ impl AimdThrottleConfig {
 
     /// Build an `AimdThrottleConfig` from storage options and environment variables.
     ///
+    /// Returns `None` if AIMD throttling is disabled via `lance_aimd_enabled` /
+    /// `LANCE_AIMD_ENABLED` (set to `0` or `false`). Enabled by default.
+    ///
     /// Storage options take precedence over environment variables, which take
     /// precedence over defaults. A single AIMD config is applied to all four
     /// operation categories (read/write/delete/list).
     ///
     /// | Setting              | Storage Option Key               | Env Var                          | Default |
     /// |----------------------|----------------------------------|----------------------------------|---------|
+    /// | Enabled              | `lance_aimd_enabled`             | `LANCE_AIMD_ENABLED`             | true    |
     /// | Initial rate         | `lance_aimd_initial_rate`        | `LANCE_AIMD_INITIAL_RATE`        | 2000    |
     /// | Min rate             | `lance_aimd_min_rate`            | `LANCE_AIMD_MIN_RATE`            | 1       |
     /// | Max rate             | `lance_aimd_max_rate`            | `LANCE_AIMD_MAX_RATE`            | 5000    |
@@ -158,7 +163,26 @@ impl AimdThrottleConfig {
     /// | Burst capacity       | `lance_aimd_burst_capacity`      | `LANCE_AIMD_BURST_CAPACITY`      | 100     |
     pub fn from_storage_options(
         storage_options: Option<&HashMap<String, String>>,
-    ) -> lance_core::Result<Self> {
+    ) -> lance_core::Result<Option<Self>> {
+        fn resolve_bool(
+            key: &str,
+            storage_options: Option<&HashMap<String, String>>,
+            default: bool,
+        ) -> bool {
+            let raw = storage_options
+                .and_then(|opts| opts.get(key).cloned())
+                .or_else(|| std::env::var(key.to_ascii_uppercase()).ok());
+            match raw.as_deref() {
+                Some("0") | Some("false") | Some("FALSE") | Some("no") | Some("NO") => false,
+                Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") => true,
+                _ => default,
+            }
+        }
+
+        if !resolve_bool("lance_aimd_enabled", storage_options, true) {
+            return Ok(None);
+        }
+
         fn resolve_f64(
             key: &str,
             storage_options: Option<&HashMap<String, String>>,
@@ -220,11 +244,25 @@ impl AimdThrottleConfig {
             .with_decrease_factor(decrease_factor)
             .with_additive_increment(additive_increment);
 
-        Ok(Self::default()
-            .with_aimd(aimd)
-            .with_burst_capacity(burst_capacity))
+        Ok(Some(
+            Self::default()
+                .with_aimd(aimd)
+                .with_burst_capacity(burst_capacity),
+        ))
     }
 }
+
+/// Minimum interval (in milliseconds) between periodic rate-log messages.
+///
+/// Configurable via the `LANCE_AIMD_LOG_INTERVAL_SECONDS` environment variable.
+/// Defaults to 1 second. Set to 0 to disable periodic logging.
+static LOG_INTERVAL_MS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    let secs: f64 = std::env::var("LANCE_AIMD_LOG_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    (secs * 1000.0) as u64
+});
 
 struct TokenBucketState {
     tokens: f64,
@@ -237,10 +275,17 @@ struct OperationThrottle {
     controller: AimdController,
     bucket: Mutex<TokenBucketState>,
     burst_capacity: f64,
+    category: &'static str,
+    /// Epoch-millis of the last periodic log message for this category.
+    last_log_ms: AtomicU64,
 }
 
 impl OperationThrottle {
-    fn new(aimd_config: AimdConfig, burst_capacity: f64) -> lance_core::Result<Self> {
+    fn new(
+        aimd_config: AimdConfig,
+        burst_capacity: f64,
+        category: &'static str,
+    ) -> lance_core::Result<Self> {
         let initial_rate = aimd_config.initial_rate;
         let controller = AimdController::new(aimd_config)?;
         Ok(Self {
@@ -251,7 +296,36 @@ impl OperationThrottle {
                 rate: initial_rate,
             }),
             burst_capacity,
+            category,
+            last_log_ms: AtomicU64::new(0),
         })
+    }
+
+    /// Emit a periodic info-level log with the current rate, at most once per
+    /// `LOG_INTERVAL_MS` milliseconds.
+    fn maybe_log_rate(&self) {
+        let interval = *LOG_INTERVAL_MS;
+        if interval == 0 {
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let prev = self.last_log_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(prev) >= interval
+            && self
+                .last_log_ms
+                .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let rate = self.controller.current_rate();
+            log::info!(
+                "AIMD throttle [{}]: current rate = {:.1} req/s",
+                self.category,
+                rate
+            );
+        }
     }
 
     /// Acquire a token from the bucket, sleeping if none are available.
@@ -314,6 +388,7 @@ impl OperationThrottle {
         Fut: std::future::Future<Output = OSResult<T>>,
     {
         self.acquire_token().await;
+        self.maybe_log_rate();
         let result = f().await;
         let outcome = match &result {
             Ok(_) => RequestOutcome::Success,
@@ -425,10 +500,10 @@ impl AimdThrottledStore {
         let burst = config.burst_capacity as f64;
         Ok(Self {
             target,
-            read: Arc::new(OperationThrottle::new(config.read, burst)?),
-            write: Arc::new(OperationThrottle::new(config.write, burst)?),
-            delete: Arc::new(OperationThrottle::new(config.delete, burst)?),
-            list: Arc::new(OperationThrottle::new(config.list, burst)?),
+            read: Arc::new(OperationThrottle::new(config.read, burst, "read")?),
+            write: Arc::new(OperationThrottle::new(config.write, burst, "write")?),
+            delete: Arc::new(OperationThrottle::new(config.delete, burst, "delete")?),
+            list: Arc::new(OperationThrottle::new(config.list, burst, "list")?),
         })
     }
 }
