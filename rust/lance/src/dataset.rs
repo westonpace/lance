@@ -2096,6 +2096,18 @@ impl Dataset {
         self.session.deep_size_of() as u64
     }
 
+    /// Returns the in-memory size, in bytes, of the stable row id index
+    /// for this dataset's current version.
+    ///
+    /// Returns `None` if stable row ids are not enabled. Forces the
+    /// index to be loaded if it is not already cached, so the first
+    /// call after opening pays the build cost.
+    pub async fn row_id_index_size_bytes(&self) -> Result<Option<u64>> {
+        Ok(get_row_id_index(self)
+            .await?
+            .map(|index| index.deep_size_of() as u64))
+    }
+
     /// Get all versions.
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let mut versions: Vec<Version> = self

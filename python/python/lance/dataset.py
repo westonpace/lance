@@ -1198,6 +1198,18 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.has_stable_row_ids
 
+    def row_id_index_size_bytes(self) -> Optional[int]:
+        """
+        Return the in-memory size, in bytes, of the stable row id index
+        for this dataset's current version, or ``None`` if stable row ids
+        are not enabled.
+
+        Forces the index to be loaded if it is not already cached, so the
+        first call after opening pays the build cost. Subsequent calls
+        against the same Dataset instance return the cached index size.
+        """
+        return self._ds.row_id_index_size_bytes()
+
     @property
     def max_field_id(self) -> int:
         """

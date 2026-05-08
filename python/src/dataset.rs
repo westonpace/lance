@@ -919,6 +919,15 @@ impl Dataset {
         self.ds.manifest().uses_stable_row_ids()
     }
 
+    /// Return the in-memory size, in bytes, of the stable row id index
+    /// for this dataset's current version, or ``None`` if stable row ids
+    /// are not enabled. Forces the index to be loaded if it is not
+    /// already cached.
+    fn row_id_index_size_bytes(&self) -> PyResult<Option<u64>> {
+        rt().block_on(None, self.ds.row_id_index_size_bytes())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
     /// Get index statistics
     fn index_statistics(&self, index_name: String) -> PyResult<String> {
         rt().block_on(None, self.ds.index_statistics(&index_name))?

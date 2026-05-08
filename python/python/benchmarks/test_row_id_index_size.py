@@ -20,13 +20,10 @@ What this measures
   shape (only the fragment metadata differs, not the data).
 - ``deletion`` / ``index`` / ``other`` ─ for completeness.
 
-What this does NOT measure
---------------------------
-
-The in-memory ``RowIdIndex`` size is not measurable from Python without
-a new binding for ``RowIdIndex::deep_size_of``. For now, the disk
-``manifest`` column is a useful proxy: the inline row id sequence on
-disk is a compact form of what's loaded into memory at build time.
+In-memory ``RowIdIndex`` size is reported via the
+``row_id_index_size_bytes`` binding (``DeepSizeOf`` on the assembled
+index). For ``stable_off`` datasets that returns ``None``; we record 0
+bytes there so the table compares cleanly.
 
 This file is a report, not a timing benchmark. Run with ``-s`` to see
 the table::
@@ -93,6 +90,7 @@ class SizeReport(NamedTuple):
     deletion: int
     index: int
     other: int
+    in_memory_index: int
 
 
 def _dataset_dir(
@@ -208,6 +206,8 @@ def size_reports(data_dir: Path) -> List[SizeReport]:
                         data_dir, stable, num_frags, updates, deletion_frac
                     )
                     sizes = _measure(uri)
+                    ds = lance.dataset(uri)
+                    in_memory = ds.row_id_index_size_bytes() if stable else None
                     out.append(
                         SizeReport(
                             stable=stable,
@@ -221,6 +221,7 @@ def size_reports(data_dir: Path) -> List[SizeReport]:
                             deletion=sizes["deletion"],
                             index=sizes["index"],
                             other=sizes["other"],
+                            in_memory_index=in_memory or 0,
                         )
                     )
     return out
@@ -264,12 +265,14 @@ def test_row_id_index_size_report(
         "| frags | upd | del% "
         "| manifest_off | manifest_on | manifest_Δ "
         "| txn_off | txn_on | txn_Δ "
+        "| in-mem index "
         "| total_off | total_on | total_Δ |"
     )
     lines.append(
         "|-------|-----|------"
         "|--------------|-------------|------------"
         "|---------|--------|--------"
+        "|--------------"
         "|-----------|----------|---------|"
     )
     for key in sorted(grouped):
@@ -285,6 +288,7 @@ def test_row_id_index_size_report(
             f"| {_fmt_bytes(on.manifest - off.manifest)} "
             f"| {_fmt_bytes(off.transaction)} | {_fmt_bytes(on.transaction)} "
             f"| {_fmt_bytes(on.transaction - off.transaction)} "
+            f"| {_fmt_bytes(on.in_memory_index)} "
             f"| {_fmt_bytes(off.total)} | {_fmt_bytes(on.total)} "
             f"| {_fmt_bytes(on.total - off.total)} |"
         )
