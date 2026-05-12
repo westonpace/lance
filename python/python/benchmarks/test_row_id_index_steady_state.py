@@ -57,11 +57,15 @@ ROWS_PER_FRAG = _env_int("BENCH_SS_ROWS_PER_FRAG", 1000)
 UPDATE_CHECKPOINTS: Tuple[int, ...] = _env_int_tuple(
     "BENCH_SS_UPDATE_CHECKPOINTS", (0, 100, 1000, 10_000)
 )
+# When set, compaction runs once after the last update checkpoint with this
+# target rows-per-fragment, and an extra "post-compact" snapshot is recorded.
+COMPACT_TARGET_ROWS = _env_int("BENCH_SS_COMPACT_TARGET_ROWS", 100_000)
 
 # ----------------------------------------------------------------------------
 
 
 class Snapshot(NamedTuple):
+    label: str
     updates: int
     fragment_count: int
     manifest_now: int
@@ -129,6 +133,10 @@ def _measure(uri: Path, ds: lance.LanceDataset) -> Tuple[int, int, int]:
 
 def _build_initial(data_dir: Path) -> Path:
     uri = _dataset_dir(data_dir)
+    # Cache hit: trust the existing dataset and skip the (slow) rebuild.
+    # Delete the cache directory manually to force a rebuild.
+    if uri.exists() and (uri / "_versions").exists():
+        return uri
     if uri.exists():
         shutil.rmtree(uri)
 
@@ -173,29 +181,47 @@ def steady_state_snapshots(data_dir: Path) -> List[Snapshot]:
     out: List[Snapshot] = []
     applied = 0
 
-    for checkpoint in sorted(UPDATE_CHECKPOINTS):
-        while applied < checkpoint:
-            ds = lance.dataset(uri)
-            idx = int(update_targets[applied])
-            ds.update(
-                {"payload": "payload + 1"},
-                where=f"row_idx = {idx}",
-            )
-            applied += 1
-
+    def snapshot(label: str) -> Snapshot:
         ds = lance.dataset(uri)
         manifest_now, data_now, deletion_now = _measure(uri, ds)
         in_memory = ds.row_id_index_size_bytes() or 0
-        out.append(
-            Snapshot(
-                updates=applied,
-                fragment_count=len(ds.get_fragments()),
-                manifest_now=manifest_now,
-                data_now=data_now,
-                deletion_now=deletion_now,
-                in_memory=in_memory,
-            )
+        return Snapshot(
+            label=label,
+            updates=applied,
+            fragment_count=len(ds.get_fragments()),
+            manifest_now=manifest_now,
+            data_now=data_now,
+            deletion_now=deletion_now,
+            in_memory=in_memory,
         )
+
+    # If the cache already has max(UPDATE_CHECKPOINTS) updates applied,
+    # skip the (slow) per-checkpoint replay and snapshot only the final
+    # state. Versions before the first update are write(1) + btree(2);
+    # each applied update bumps the version.
+    cached_version = lance.dataset(uri).version
+    cached_updates = max(0, cached_version - 2)
+    max_target = max(UPDATE_CHECKPOINTS)
+
+    if cached_updates >= max_target:
+        applied = cached_updates
+        out.append(snapshot(f"updates={applied:,}"))
+    else:
+        for checkpoint in sorted(UPDATE_CHECKPOINTS):
+            while applied < checkpoint:
+                ds = lance.dataset(uri)
+                idx = int(update_targets[applied])
+                ds.update(
+                    {"payload": "payload + 1"},
+                    where=f"row_idx = {idx}",
+                )
+                applied += 1
+            out.append(snapshot(f"updates={applied:,}"))
+
+    if COMPACT_TARGET_ROWS > 0:
+        ds = lance.dataset(uri)
+        ds.optimize.compact_files(target_rows_per_fragment=COMPACT_TARGET_ROWS)
+        out.append(snapshot(f"after compact ({COMPACT_TARGET_ROWS:,} rows/frag)"))
 
     return out
 
@@ -229,18 +255,18 @@ def test_steady_state_size_report(
     )
     lines.append("")
     lines.append(
-        "| updates | fragments "
+        "| state | fragments "
         "| manifest_now | data_now | deletion_now "
         "| in-memory index | total point-in-time |"
     )
     lines.append(
-        "|---------|-----------"
+        "|-------|-----------"
         "|--------------|----------|---------------"
         "|-----------------|----------------------|"
     )
     for s in steady_state_snapshots:
         lines.append(
-            f"| {s.updates:,} | {s.fragment_count:,} "
+            f"| {s.label} | {s.fragment_count:,} "
             f"| {_fmt_bytes(s.manifest_now)} | {_fmt_bytes(s.data_now)} "
             f"| {_fmt_bytes(s.deletion_now)} "
             f"| {_fmt_bytes(s.in_memory)} "
