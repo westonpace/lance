@@ -106,6 +106,7 @@ pub struct ZoneMapIndex {
     data_type: DataType,
     // The maximum rows per zone provided by user
     rows_per_zone: u64,
+    use_seeds: bool,
     store: Arc<dyn IndexStore>,
     fri: Option<Arc<FragReuseIndex>>,
     index_cache: WeakLanceCache,
@@ -117,6 +118,7 @@ impl std::fmt::Debug for ZoneMapIndex {
             .field("zones", &self.zones)
             .field("data_type", &self.data_type)
             .field("rows_per_zone", &self.rows_per_zone)
+            .field("use_seeds", &self.use_seeds)
             .field("store", &self.store)
             .field("fri", &self.fri)
             .field("index_cache", &self.index_cache)
@@ -406,11 +408,17 @@ impl ZoneMapIndex {
         }
     }
 
+    /// Returns the rows-per-zone parameter for this index.
+    pub fn rows_per_zone(&self) -> u64 {
+        self.rows_per_zone
+    }
+
     /// Load the scalar index from storage
     async fn load(
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<FragReuseIndex>>,
         index_cache: &LanceCache,
+        use_seeds: bool,
     ) -> Result<Arc<Self>>
     where
         Self: Sized,
@@ -432,6 +440,7 @@ impl ZoneMapIndex {
             fri,
             index_cache,
             rows_per_zone,
+            use_seeds,
         )?))
     }
 
@@ -441,6 +450,7 @@ impl ZoneMapIndex {
         fri: Option<Arc<FragReuseIndex>>,
         index_cache: &LanceCache,
         rows_per_zone: u64,
+        use_seeds: bool,
     ) -> Result<Self> {
         // The RecordBatch should have columns: min, max, null_count
         let min_col = data
@@ -499,6 +509,7 @@ impl ZoneMapIndex {
                 zones: Vec::new(),
                 data_type,
                 rows_per_zone,
+                use_seeds,
                 store,
                 fri,
                 index_cache: WeakLanceCache::from(index_cache),
@@ -530,6 +541,7 @@ impl ZoneMapIndex {
             zones,
             data_type,
             rows_per_zone,
+            use_seeds,
             store,
             fri,
             index_cache: WeakLanceCache::from(index_cache),
@@ -626,8 +638,7 @@ impl ScalarIndex for ZoneMapIndex {
         let file = builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
-                .unwrap(),
+            index_details: make_zone_map_index_details(self.rows_per_zone, self.use_seeds),
             index_version: ZONEMAP_INDEX_VERSION,
             files: vec![file],
         })
@@ -640,7 +651,10 @@ impl ScalarIndex for ZoneMapIndex {
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        let params = serde_json::to_value(ZoneMapIndexBuilderParams::new(self.rows_per_zone))?;
+        let params = serde_json::to_value(ZoneMapIndexBuilderParams {
+            rows_per_zone: self.rows_per_zone,
+            use_seeds: Some(self.use_seeds),
+        })?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&params))
     }
 }
@@ -655,6 +669,7 @@ pub async fn merge_zonemap_indices(
         Error::invalid_input("merge_zonemap_indices requires at least one source index")
     })?;
     let rows_per_zone = first.rows_per_zone;
+    let use_seeds = first.use_seeds;
     let data_type = first.data_type.clone();
 
     let mut zones = Vec::new();
@@ -690,10 +705,41 @@ pub async fn merge_zonemap_indices(
     builder.write_index(dest_store).await?;
 
     Ok(CreatedIndex {
-        index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default()).unwrap(),
+        index_details: make_zone_map_index_details(rows_per_zone, use_seeds),
         index_version: ZONEMAP_INDEX_VERSION,
         files: dest_store.list_files_with_sizes().await?,
     })
+}
+
+fn make_zone_map_index_details(rows_per_zone: u64, use_seeds: bool) -> prost_types::Any {
+    prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails {
+        rows_per_zone: Some(rows_per_zone),
+        use_seeds: Some(use_seeds),
+    })
+    .unwrap()
+}
+
+/// Returns true when seed-based incremental updates should be enabled by
+/// default for the given column type.
+///
+/// Seeds pay off for variable-length types (strings, binary) — which can be
+/// arbitrarily wide — and fixed-width types wider than 8 bytes (e.g.
+/// Decimal128, FixedSizeBinary tensors). Fixed-width types ≤ 8 bytes (Int64,
+/// Float64, …) scan fast enough that the seed overhead is not worth it.
+fn default_use_seeds(data_type: &DataType) -> bool {
+    match data_type {
+        // Variable-length: width is unbounded, skipping scans is always valuable.
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView => true,
+        // Fixed-width types wider than 8 bytes.
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => true,
+        DataType::FixedSizeBinary(n) => *n > 8,
+        _ => false,
+    }
 }
 
 fn default_rows_per_zone() -> u64 {
@@ -704,6 +750,12 @@ fn default_rows_per_zone() -> u64 {
 pub struct ZoneMapIndexBuilderParams {
     #[serde(default = "default_rows_per_zone")]
     rows_per_zone: u64,
+    /// Whether to embed per-fragment seed buffers in data files for use during
+    /// incremental index updates. `None` means auto-detect based on column type
+    /// (see [`default_use_seeds`]). Resolved to a concrete `bool` during
+    /// training in [`ZoneMapIndexPlugin::new_training_request`].
+    #[serde(default)]
+    use_seeds: Option<bool>,
 }
 
 static DEFAULT_ROWS_PER_ZONE: LazyLock<u64> = LazyLock::new(|| {
@@ -717,13 +769,17 @@ impl Default for ZoneMapIndexBuilderParams {
     fn default() -> Self {
         Self {
             rows_per_zone: *DEFAULT_ROWS_PER_ZONE,
+            use_seeds: None,
         }
     }
 }
 
 impl ZoneMapIndexBuilderParams {
     pub fn new(rows_per_zone: u64) -> Self {
-        Self { rows_per_zone }
+        Self {
+            rows_per_zone,
+            use_seeds: None,
+        }
     }
 
     pub fn rows_per_zone(&self) -> u64 {
@@ -977,7 +1033,11 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             ));
         }
 
-        let params = serde_json::from_str::<ZoneMapIndexBuilderParams>(params)?;
+        let mut params = serde_json::from_str::<ZoneMapIndexBuilderParams>(params)?;
+        // Resolve None → type-based default so train_index always sees Some(bool).
+        if params.use_seeds.is_none() {
+            params.use_seeds = Some(default_use_seeds(field.data_type()));
+        }
 
         Ok(Box::new(ZoneMapIndexTrainingRequest::new(params)))
     }
@@ -1017,10 +1077,11 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
                     "must provide training request created by new_training_request".into(),
                 )
             })?;
+        let rows_per_zone = request.params.rows_per_zone;
+        let use_seeds = request.params.use_seeds.unwrap_or(false);
         let file = Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
-                .unwrap(),
+            index_details: make_zone_map_index_details(rows_per_zone, use_seeds),
             index_version: ZONEMAP_INDEX_VERSION,
             files: vec![file],
         })
@@ -1029,11 +1090,19 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
+        index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(ZoneMapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+        let use_seeds = index_details
+            .to_msg::<pbold::ZoneMapIndexDetails>()
+            .ok()
+            .and_then(|d| d.use_seeds)
+            .unwrap_or(false);
+        Ok(
+            ZoneMapIndex::load(index_store, frag_reuse_index, cache, use_seeds).await?
+                as Arc<dyn ScalarIndex>,
+        )
     }
 }
 
