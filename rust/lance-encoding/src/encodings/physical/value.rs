@@ -543,7 +543,7 @@ impl ValueDecompressor {
         }
     }
 
-    pub fn from_fsl(mut description: &pb21::FixedSizeList) -> Self {
+    pub fn from_fsl(mut description: &pb21::FixedSizeList) -> Result<Self> {
         let mut layers = Vec::new();
         let mut cum_dim = 1;
         let mut bytes_per_value = 0;
@@ -556,38 +556,45 @@ impl ValueDecompressor {
             if description.has_validity {
                 bytes_per_value += cum_dim.div_ceil(8);
             }
-            match description
+            let encoding = description
                 .values
                 .as_ref()
-                .unwrap()
+                .ok_or_else(|| Error::invalid_input("FSL encoding missing inner values field"))?
                 .compression
                 .as_ref()
-                .unwrap()
-            {
+                .ok_or_else(|| {
+                    Error::invalid_input("FSL encoding missing inner compression field")
+                })?;
+            match encoding {
                 Compression::FixedSizeList(inner) => {
                     description = inner;
                 }
                 Compression::Flat(flat) => {
                     let mut bits_per_value = bytes_per_value * 8;
                     bits_per_value += flat.bits_per_value * cum_dim;
-                    return Self {
+                    return Ok(Self {
                         bits_per_item: flat.bits_per_value,
                         bits_per_value,
                         items_per_value: cum_dim,
                         layers,
-                    };
+                    });
                 }
                 // All inner values are null: only validity bytes are stored per row.
                 // bits_per_item=0 signals unzip_decompress to emit AllNull for the values.
                 Compression::Constant(_) => {
-                    return Self {
+                    return Ok(Self {
                         bits_per_item: 0,
                         bits_per_value: bytes_per_value * 8,
                         items_per_value: cum_dim,
                         layers,
-                    };
+                    });
                 }
-                _ => unreachable!(),
+                _ => {
+                    return Err(Error::invalid_input(format!(
+                        "Unexpected inner encoding type in FSL descriptor: {:?}",
+                        encoding
+                    )))
+                }
             }
         }
     }
@@ -1068,7 +1075,7 @@ mod tests {
             panic!()
         };
 
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
 
         let decompressed =
             MiniBlockDecompressor::decompress(&decompressor, data.data, data.num_values).unwrap();
@@ -1156,7 +1163,7 @@ mod tests {
             panic!()
         };
 
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
 
         let num_values = data.num_values;
         assert_eq!(
@@ -1258,7 +1265,7 @@ mod tests {
             panic!()
         };
 
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
 
         let decompressed =
             MiniBlockDecompressor::decompress(&decompressor, data.data, data.num_values).unwrap();
@@ -1288,7 +1295,7 @@ mod tests {
             panic!()
         };
 
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
 
         let PerValueDataBlock::Fixed(data) = data else {
             panic!()

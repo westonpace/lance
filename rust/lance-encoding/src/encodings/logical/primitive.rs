@@ -7564,7 +7564,7 @@ mod tests {
         let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
             panic!("expected fixed-size-list compression");
         };
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
         let expected_size = num_rows * dimension * size_of::<f32>();
         assert_eq!(
             FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_rows as u64),
@@ -7636,7 +7636,7 @@ mod tests {
             panic!("expected fixed-size-list compression");
         };
         let decompressor = NullableFslDecompressor {
-            inner: ValueDecompressor::from_fsl(fsl.as_ref()),
+            inner: ValueDecompressor::from_fsl(fsl.as_ref()).unwrap(),
         };
         assert_eq!(
             FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_rows as u64),
