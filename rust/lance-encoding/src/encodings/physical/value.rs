@@ -593,7 +593,7 @@ impl ValueDecompressor {
                     return Err(Error::invalid_input(format!(
                         "Unexpected inner encoding type in FSL descriptor: {:?}",
                         encoding
-                    )))
+                    )));
                 }
             }
         }
