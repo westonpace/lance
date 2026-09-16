@@ -104,8 +104,7 @@ BASIC_LARGE_IN_FILTER = (
 )
 # row_number runs 0..10M, so this selects 7M rows (70% of the dataset).  Both
 # bounds land mid-page, so the scan has to walk the great majority of the
-# btree's leaves and union their row id lists — the path a small_range query,
-# which only ever touches a single leaf, never exercises.
+# btree's leaves and union their row id lists
 BASIC_LARGE_RANGE_FILTER = "row_number >= 1000000 AND row_number < 8000000"
 
 BASIC_BTREE_FILTERS = [
