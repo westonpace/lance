@@ -838,6 +838,20 @@ fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) 
 ///
 /// Older vector segments may not have `VectorIndexDetails` in the manifest, so
 /// we also recognize them by the legacy monolithic index file name.
+/// Whether `index` should have the fragment-reuse index applied to it.
+///
+/// The FRI remaps row *addresses*. Without stable row ids an address is the row
+/// id, so every index is a consumer. With stable row ids only an address-domain
+/// index holds anything the FRI can repair, and the two domains are not merely
+/// redundant there but actively unsafe to confuse: stable row ids start at zero
+/// and increment, so a row id is numerically indistinguishable from an address
+/// into fragment 0 and the FRI would silently rewrite valid row ids.
+///
+/// Transitional. This collapses to `true` once every index stores row addresses.
+pub(crate) fn index_consumes_frag_reuse(dataset: &Dataset, index: &IndexMetadata) -> bool {
+    !dataset.manifest.uses_stable_row_ids() || index.results_are_row_addrs()
+}
+
 fn segment_has_vector_details(segment: &IndexMetadata) -> bool {
     segment.index_details.as_ref().map_or_else(
         || {
@@ -3032,11 +3046,19 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let index_meta = self
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
+        // A vector index stores row ids, so under stable row ids it has nothing
+        // for the FRI to repair. Keep it out of the cache keys too, so its
+        // entries are not invalidated by every compaction.
+        let consumes_frag_reuse = index_consumes_frag_reuse(self, &index_meta);
+        let frag_reuse_uuid = if consumes_frag_reuse {
+            self.frag_reuse_index_uuid().await
+        } else {
+            None
+        };
         let object_store = self.object_store_for_index(&index_meta).await?;
 
         // Check sized cache first (v2+ indices with serializable state).
@@ -3044,7 +3066,11 @@ impl DatasetIndexInternalExt for Dataset {
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
-            let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
+            let frag_reuse_index = if consumes_frag_reuse {
+                self.open_frag_reuse_index(metrics).await?
+            } else {
+                None
+            };
             return entry
                 .0
                 .reconstruct(
@@ -3062,7 +3088,11 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(cached.0.clone());
         }
 
-        let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
+        let frag_reuse_index = if consumes_frag_reuse {
+            self.open_frag_reuse_index(metrics).await?
+        } else {
+            None
+        };
         let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir
             .clone()

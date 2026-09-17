@@ -572,7 +572,11 @@ pub async fn open_scalar_index(
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
-    let frag_reuse_index = dataset.open_frag_reuse_index(metrics).await?;
+    let frag_reuse_index = if crate::index::index_consumes_frag_reuse(dataset, index) {
+        dataset.open_frag_reuse_index(metrics).await?
+    } else {
+        None
+    };
 
     let index_cache = dataset
         .index_cache
