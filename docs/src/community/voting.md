@@ -119,7 +119,7 @@ re-check immediately.
 For a trivial edit that does not change the format — a typo, wording, or
 formatting fix — a PMC member may apply the `format-waived` label to waive the
 vote.
-=======
+
 ## Experimental Specification Features
 
 Certain format specification changes may be merged as **experimental** before their stabilization vote closes.
@@ -155,4 +155,3 @@ to provide early feedback.
 4. When ready, open a PR to remove the experimental markers.  This is the PR that will carry the vote.  Merging this PR
 stabilized the feature.
 5. If the stabilization PR **fails or expires**, remove the feature from the codebase and specification.
->>>>>>> 3646fe0f4 (Add experimental features to the governance docs)
