@@ -22,7 +22,7 @@ the index can store 256K leaves of size 4K each, requiring only a few MiB of mem
 The BTree index consists of two files:
 
 1. `page_lookup.lance` - The BTree structure mapping value ranges to page numbers
-2. `page_data.lance` - The actual sub-indices (flat file) containing sorted values and row IDs
+2. `page_data.lance` - The actual sub-indices (flat file) containing sorted values and row addresses
 
 ### Page Lookup File Schema (BTree Structure)
 
@@ -38,13 +38,14 @@ The BTree index consists of two files:
 | Key | Type | Description |
 |-----|------|-------------|
 | `batch_size` | String | Number of rows per page (default: "4096") |
+| `id_domain` | String | `"row_addr"` when the `ids` column stores physical row addresses (format version 1+); absent on a segment persisted before that, which stores row ids directly |
 
 ### Page Data File Schema (Sub-indices)
 
 | Column   | Type       | Nullable | Description                                       |
 |----------|------------|----------|---------------------------------------------------|
 | `values` | {DataType} | true     | Sorted values from the indexed column (flat file) |
-| `ids`    | UInt64     | false    | Row IDs corresponding to each value               |
+| `ids`    | UInt64     | false    | Physical row address (`fragment_id << 32 \| offset`) corresponding to each value. A segment persisted before format version 1 stores a row id here instead (see `id_domain` above). |
 
 ## Accelerated Queries
 
