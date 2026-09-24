@@ -980,7 +980,7 @@ impl DistCalculator for PQDistCalculator {
     }
 }
 
-fn build_pairwise_distance_table<T: L2 + Cosine + Dot>(
+pub(crate) fn build_pairwise_distance_table<T: L2 + Cosine + Dot>(
     codebook: &[T],
     num_bits: u32,
     num_sub_vectors: usize,
