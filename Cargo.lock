@@ -4481,6 +4481,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
+ "blake3",
  "byteorder",
  "bytes",
  "chrono",
@@ -4953,6 +4954,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
