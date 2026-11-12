@@ -1122,8 +1122,9 @@ impl ExecutionPlan for FlatMatchQueryExec {
                             .await?
                         }
                         PreFilterSource::ScalarIndexQuery(input) => {
-                            Box::new(SelectionVectorToPrefilter(
+                            Box::new(SelectionVectorToPrefilter::new(
                                 input.execute(partition, context)?,
+                                ds.clone(),
                             ))
                             .load()
                             .await?

@@ -320,7 +320,11 @@ fn shared_prefilter_future(
     is_scalar_index_query: bool,
     context: Arc<datafusion::execution::TaskContext>,
     partition: usize,
+    dataset: Arc<Dataset>,
 ) -> BoxFuture<'static, Result<Arc<RowAddrMask>>> {
+    let is_prefilter_union = source
+        .downcast_ref::<super::prefilter_union::PrefilterUnionExec>()
+        .is_some();
     async move {
         let context_id = Arc::as_ptr(&context) as usize;
         let key = (context_id, partition);
@@ -352,7 +356,12 @@ fn shared_prefilter_future(
                             let result = async move {
                                 let stream = source.execute(partition, context)?;
                                 if is_scalar_index_query {
-                                    Box::new(SelectionVectorToPrefilter(stream)).load().await
+                                    Box::new(
+                                        SelectionVectorToPrefilter::new(stream, dataset)
+                                            .with_already_row_id_domain(is_prefilter_union),
+                                    )
+                                    .load()
+                                    .await
                                 } else {
                                     Box::new(FilteredRowIdsToPrefilter::new(stream))
                                         .load()
@@ -398,6 +407,7 @@ fn prefilter_mask_future(
     prefilter_source: &PreFilterSource,
     external_mask: Option<Arc<RowAddrMask>>,
     metrics: &ExecutionPlanMetricsSet,
+    dataset: Arc<Dataset>,
 ) -> Result<Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>> {
     let mut shared_filter = None;
     let prefilter_loader = match &prefilter_source {
@@ -409,6 +419,7 @@ fn prefilter_mask_future(
                     false,
                     context,
                     partition,
+                    dataset,
                 ));
                 None
             } else {
@@ -428,11 +439,18 @@ fn prefilter_mask_future(
                     true,
                     context,
                     partition,
+                    dataset,
                 ));
                 None
             } else {
+                let is_prefilter_union = src_node
+                    .downcast_ref::<super::prefilter_union::PrefilterUnionExec>()
+                    .is_some();
                 let stream = src_node.execute(partition, context)?;
-                Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
+                Some(Box::new(
+                    SelectionVectorToPrefilter::new(stream, dataset)
+                        .with_already_row_id_domain(is_prefilter_union),
+                ) as Box<dyn FilterLoader>)
             }
         }
         PreFilterSource::None => None,
@@ -477,6 +495,7 @@ pub(crate) fn build_prefilter(
         prefilter_source,
         masks.external_mask,
         metrics,
+        ds.clone(),
     )?;
     let mut prefilter = DatasetPreFilter::new_with_filter_future(ds, index_meta, filter);
     if let Some(overlay_block) = masks.overlay_block {
@@ -503,6 +522,7 @@ pub(crate) fn build_prefilter_restricted_to_fragments(
         prefilter_source,
         masks.external_mask,
         metrics,
+        ds.clone(),
     )?;
     let mut prefilter = DatasetPreFilter::new_restricted_to_fragments(ds, fragments, filter);
     if let Some(overlay_block) = masks.overlay_block {
@@ -598,12 +618,39 @@ impl FilterLoader for FilteredRowIdsToPrefilter {
 }
 
 // Utility to convert a serialized selection vector into a prefilter
-pub(crate) struct SelectionVectorToPrefilter(pub SendableRecordBatchStream);
+pub(crate) struct SelectionVectorToPrefilter {
+    stream: SendableRecordBatchStream,
+    dataset: Arc<Dataset>,
+    // The wire format carries no domain bit, so the producer's identity decides
+    // how to interpret it: `ScalarIndexExec` always emits row-address domain
+    // (needs converting, see below), but `PrefilterUnionExec` already finalizes
+    // its own combined result to row-id domain before serializing (to match its
+    // `missing` branch) — converting its output again would corrupt it, treating
+    // genuine row ids as if they were addresses.
+    already_row_id_domain: bool,
+}
+
+impl SelectionVectorToPrefilter {
+    pub(crate) fn new(stream: SendableRecordBatchStream, dataset: Arc<Dataset>) -> Self {
+        Self {
+            stream,
+            dataset,
+            already_row_id_domain: false,
+        }
+    }
+
+    /// Mark the source as already row-id domain (a `PrefilterUnionExec`), so
+    /// `load` does not re-finalize it.
+    pub(crate) fn with_already_row_id_domain(mut self, already_row_id_domain: bool) -> Self {
+        self.already_row_id_domain = already_row_id_domain;
+        self
+    }
+}
 
 #[async_trait]
 impl FilterLoader for SelectionVectorToPrefilter {
     async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
-        let batch = self.0.try_next().await?.ok_or_else(|| {
+        let batch = self.stream.try_next().await?.ok_or_else(|| {
             Error::internal("Selection vector source for prefilter did not yield any batches")
         })?;
         // The vector-search prefilter wants the set of rows the search is
@@ -615,6 +662,15 @@ impl FilterLoader for SelectionVectorToPrefilter {
         // support both the TwoMask and the legacy ThreeVariant wire formats
         // that ScalarIndexExec may emit.
         let (result, _) = IndexExprResult::deserialize(&batch)?;
+        // Vector/PQ indices are keyed by stable row id (trained with
+        // `.with_row_id()`), so convert here before this mask is matched
+        // against those ids — unless the source already did so (see
+        // `already_row_id_domain`).
+        let result = if self.already_row_id_domain {
+            result
+        } else {
+            super::scalar_index::finalize_to_row_ids(&self.dataset, result).await?
+        };
         Ok(result.upper)
     }
 }
@@ -1366,7 +1422,7 @@ mod tests {
     use futures::{StreamExt, TryStreamExt, stream};
     use lance_core::{ROW_ID, utils::futures::Capacity};
     use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
-    use lance_datagen::{BatchCount, RowCount, array};
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_index::prefilter::FilterLoader;
     use lance_select::result::IndexExprResultWireFormat;
     use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResult};
@@ -1378,6 +1434,22 @@ mod tests {
         SharedPreFilterExec, SharedPreFilterMaterialization, prefilter_mask_future,
         shared_prefilter_future,
     };
+    use crate::Dataset;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    // A minimal non-stable-row-id dataset, purely to satisfy
+    // `shared_prefilter_future`/`SelectionVectorToPrefilter`'s dataset
+    // parameter in tests that don't otherwise need a real one — the
+    // row-id -> row-address finalization it does is then a guaranteed no-op.
+    async fn test_dataset() -> Arc<Dataset> {
+        Arc::new(
+            gen_batch()
+                .col("i", array::step::<arrow_array::types::Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(1))
+                .await
+                .unwrap(),
+        )
+    }
 
     #[test]
     fn test_index_stage_timings() {
@@ -1524,6 +1596,7 @@ mod tests {
             "every field must declare its shared source dependency"
         );
         let context = Arc::new(datafusion::execution::TaskContext::default());
+        let dataset = test_dataset().await;
         let masks = futures::future::try_join_all(shared_sources.iter().map(|source| {
             shared_prefilter_future(
                 shared_materialization(source),
@@ -1531,6 +1604,7 @@ mod tests {
                 is_scalar_index_query,
                 context.clone(),
                 0,
+                dataset.clone(),
             )
         }))
         .await
@@ -1572,12 +1646,14 @@ mod tests {
         let source = PreFilterSource::FilteredRowIds(Arc::new(OneShotExec::new(stream)));
         let shared_sources = source.shared_for_multimatch_fields(2);
         let context = Arc::new(datafusion::execution::TaskContext::default());
+        let dataset = test_dataset().await;
         let left = shared_prefilter_future(
             shared_materialization(&shared_sources[0]),
             shared_source(&shared_sources[0]),
             false,
             context.clone(),
             0,
+            dataset.clone(),
         );
         let right = shared_prefilter_future(
             shared_materialization(&shared_sources[1]),
@@ -1585,6 +1661,7 @@ mod tests {
             false,
             context,
             0,
+            dataset,
         );
         let (left, right) = tokio::join!(left, right);
 
@@ -1635,12 +1712,14 @@ mod tests {
         let shared_sources = source.shared_for_multimatch_fields(2);
         let materialization = shared_materialization(&shared_sources[0]);
         let context = Arc::new(datafusion::execution::TaskContext::default());
+        let dataset = test_dataset().await;
         let first = tokio::spawn(shared_prefilter_future(
             materialization.clone(),
             shared_source(&shared_sources[0]),
             false,
             context.clone(),
             0,
+            dataset.clone(),
         ));
         tokio::time::timeout(std::time::Duration::from_secs(5), has_started)
             .await
@@ -1652,6 +1731,7 @@ mod tests {
             false,
             context,
             0,
+            dataset,
         ));
         loop {
             let waiters = materialization
@@ -1704,6 +1784,7 @@ mod tests {
             false,
             Arc::new(datafusion::execution::TaskContext::default()),
             0,
+            test_dataset().await,
         ));
         tokio::time::timeout(std::time::Duration::from_secs(5), has_started)
             .await
@@ -1753,6 +1834,7 @@ mod tests {
     struct MultiMatchPrefilterConsumer {
         field_sources: Vec<PreFilterSource>,
         schema: SchemaRef,
+        dataset: Arc<Dataset>,
     }
 
     impl PartitionStream for MultiMatchPrefilterConsumer {
@@ -1771,6 +1853,7 @@ mod tests {
                         source,
                         None,
                         &ExecutionPlanMetricsSet::new(),
+                        self.dataset.clone(),
                     )
                     .map(|mask| mask.expect("a filtered MultiMatch field loads a prefilter"))
                 })
@@ -1819,9 +1902,17 @@ mod tests {
             DataType::UInt64,
             true,
         )]));
+        let dataset = Arc::new(
+            gen_batch()
+                .col("i", array::step::<arrow_array::types::Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(1))
+                .await
+                .unwrap(),
+        );
         let consumer = Arc::new(MultiMatchPrefilterConsumer {
             field_sources,
             schema: output_schema.clone(),
+            dataset,
         });
         let plan: Arc<dyn ExecutionPlan> = Arc::new(
             StreamingTableExec::try_new(

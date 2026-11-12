@@ -22,11 +22,14 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, utils::address::RowAddress};
 use lance_index::prefilter::FilterLoader;
 use lance_select::{
-    IndexExprResult, RowAddrMask, RowAddrTreeMap, result::IndexExprResultWireFormat,
+    IndexExprResult, MaskDomain, RowAddrMask, RowAddrTreeMap, result::IndexExprResultWireFormat,
 };
 use roaring::RoaringBitmap;
 
-use super::utils::{FilteredRowIdsToPrefilter, InstrumentedRecordBatchStreamAdapter};
+use super::{
+    scalar_index::finalize_to_row_ids,
+    utils::{FilteredRowIdsToPrefilter, InstrumentedRecordBatchStreamAdapter},
+};
 use crate::{Dataset, index::prefilter::DatasetPreFilter};
 
 /// Bound an exact scalar mask to its current fragment membership and union it
@@ -51,11 +54,14 @@ pub struct PrefilterUnionExec {
 impl PrefilterUnionExec {
     /// Construct a scoped mask source, coalescing each input to one partition.
     ///
-    /// `scalar` must emit one exact [`IndexExprResult`] batch in `format`.
+    /// `scalar` must emit one exact [`IndexExprResult`] batch in `format` —
+    /// always row-address domain on the wire (a `ScalarIndexExec`'s output
+    /// contract), converted to row-id domain internally before combining, to
+    /// match `missing` and this node's own `_rowid`-domain output contract.
     /// `missing`, when present, emits `_rowid` values from the remaining evaluated
     /// fragments. `scope` bounds the scalar mask; `coverage` records every
-    /// evaluated fragment, including the missing branch. Both children must use
-    /// the dataset's `_rowid` domain and the same immutable dataset snapshot.
+    /// evaluated fragment, including the missing branch. Both children use
+    /// the same immutable dataset snapshot.
     /// Child order for codecs is scalar first, followed by the optional row-ID input.
     /// An empty `scope` removes all scalar matches: without `missing` the result
     /// is an exact empty mask; with `missing` its row-ID matches are retained.
@@ -249,6 +255,7 @@ impl ExecutionPlan for PrefilterUnionExec {
         let coverage = self.coverage.clone();
         let format = self.format;
         let metrics = self.metrics.clone();
+        let dataset = self.dataset.clone();
         let future = async move {
             let scalar_future = async {
                 let batch = scalar.try_next().await?.ok_or_else(|| {
@@ -262,6 +269,11 @@ impl ExecutionPlan for PrefilterUnionExec {
                     )));
                 }
                 let (result, _) = IndexExprResult::deserialize(&batch)?;
+                // The scalar child (a `ScalarIndexExec`) is always row-address
+                // domain on the wire; this node's own output, and the `missing`
+                // branch below, are pinned to the dataset's row-id domain (see
+                // the struct doc), so convert once here before combining.
+                let result = finalize_to_row_ids(&dataset, result).await?;
                 if !result.is_exact() {
                     return Err(Error::internal(
                         "PrefilterUnionExec scalar child returned an inexact mask",
@@ -296,7 +308,13 @@ impl ExecutionPlan for PrefilterUnionExec {
                 // A complement needs the scope's allow-list to become a finite selection.
                 RowAddrMask::BlockList(_) => scalar & selection.as_ref().clone(),
             };
+            // The wire format carries no domain bit and this is serialized
+            // immediately below (the in-memory `IndexExprResult` and its
+            // domain tag never escape this function), but tag it accurately
+            // for any future in-memory use: `scalar`/`missing` were both
+            // brought into row-id domain above.
             IndexExprResult::exact(scalar | missing)
+                .with_domain(MaskDomain::RowId)
                 .serialize(&coverage, format)
                 .map_err(DataFusionError::from)
         };
