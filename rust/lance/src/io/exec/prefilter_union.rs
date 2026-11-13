@@ -58,6 +58,11 @@ impl PrefilterUnionExec {
     /// always row-address domain on the wire (a `ScalarIndexExec`'s output
     /// contract), converted to row-id domain internally before combining, to
     /// match `missing` and this node's own `_rowid`-domain output contract.
+    /// That contract is pinned to row-id domain because this node's output
+    /// feeds the vector-search prefilter (`FilterLoader`/`PreFilter`), which
+    /// keys every mask by `_rowid` regardless of this module's own
+    /// address-domain migration — see `scalar_index::finalize_to_row_ids`'s
+    /// doc comment for the full reasoning.
     /// `missing`, when present, emits `_rowid` values from the remaining evaluated
     /// fragments. `scope` bounds the scalar mask; `coverage` records every
     /// evaluated fragment, including the missing branch. Both children use

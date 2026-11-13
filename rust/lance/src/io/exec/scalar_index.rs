@@ -169,11 +169,38 @@ pub(crate) async fn finalize_to_row_addrs(
 /// non-stable-row-id dataset, where address and id coincide).
 ///
 /// Unlike [`finalize_to_row_addrs`], this is the slow direction (a
-/// `RowIdSequence` scan per fragment) — it exists for [`MaterializeIndexExec`],
-/// whose take-by-id contract genuinely needs row ids, and for
-/// [`super::prefilter_union::PrefilterUnionExec`], whose `missing` branch is
-/// pinned to row-id domain (see that module); the fast path to
-/// [`super::filtered_read::FilteredReadExec`] never calls this.
+/// `RowIdSequence` scan per fragment); the fast path to
+/// [`super::filtered_read::FilteredReadExec`] never calls this. Both
+/// remaining call sites were checked for a conversion to row-address domain;
+/// only one turned out to be fundamental.
+///
+/// [`super::prefilter_union::PrefilterUnionExec`]'s `missing` branch is
+/// pinned to row-id domain because the whole node's output feeds the ANN/IVF
+/// vector search prefilter contract (`FilterLoader`/`PreFilter` in
+/// `lance_index::prefilter`, applied through `RowAddrMaskFilterExec` and
+/// `MaskAndLoader`), which keys its mask by `_rowid` — the stable row id on a
+/// stable-row-id dataset, by that subsystem's own long-standing convention,
+/// independent of and predating this module's address-domain migration.
+/// Converting this node would mean migrating vector search's prefilter
+/// contract too, which is a separate, much larger effort.
+///
+/// [`MaterializeIndexExec`] has no comparable hard requirement: its
+/// downstream take (`TakeExec::get_row_addrs`, and `FilteredReadExec` via
+/// `Scanner::take_current`) already prefers a row-address input over a
+/// row-id one and skips id resolution entirely when given one. The
+/// conversion here exists only because this node ANDs the index result with
+/// a deletion mask (`DatasetPreFilter::create_deletion_mask`) and a
+/// stale-row overlay mask (`crate::index::visibility::IndexVisibility`),
+/// both of which are hard-coded to row-id domain for *any* stable-row-id
+/// dataset — not because of this query's own index domain, but because that
+/// choice also has to support a still-unmigrated, row-id-domain index result
+/// overlapping an address-domain unindexed-fragment scan (see
+/// `DatasetPreFilter::do_create_deletion_mask_row_id`'s doc comment).
+/// Row-address output is therefore possible but needs those two helpers
+/// taught to produce an address-domain mask on request instead of being tied
+/// to the dataset's stable-row-id flag — a separate change with its own
+/// blast radius, best done once every builtin index type has finished
+/// migrating off row-id domain.
 pub(crate) async fn finalize_to_row_ids(
     dataset: &Dataset,
     result: IndexExprResult,
